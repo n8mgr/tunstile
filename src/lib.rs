@@ -2,15 +2,19 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 use tai64::Tai64N;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const LABEL_MAC_1: &'static str = "mac1----";
-const LABEL_COOKIE: &'static str = "cookie--";
+const LABEL_MAC_1: &[u8] = b"mac1----";
+const LABEL_COOKIE: &[u8] = b"cookie--";
 
 // C := HASH(Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s)
 const INITIAL_CONSTR_HASH: &[u8] = &[
-    96, 226, 109, 174, 243, 39, 239, 192, 46, 195, 53, 226, 160, 37, 210, 208, 22, 235, 66, 6, 248, 114, 119, 245, 45, 56, 209, 152, 139, 120, 205, 54];
-
+    96, 226, 109, 174, 243, 39, 239, 192, 46, 195, 53, 226, 160, 37, 210, 208, 22, 235, 66, 6, 248,
+    114, 119, 245, 45, 56, 209, 152, 139, 120, 205, 54,
+];
 // H := HASH(C || WireGuard v1 zx2c4 Jason@zx2c4.com)
-const INITIAL_IDENTIFIER_HASH: &[u8] = &[34, 17, 179, 97, 8, 26, 197, 102, 105, 18, 67, 219, 69, 138, 213, 50, 45, 156, 108, 102, 34, 147, 232, 183, 14, 225, 156, 101, 186, 7, 158, 243];
+const INITIAL_IDENTIFIER_HASH: &[u8] = &[
+    34, 17, 179, 97, 8, 26, 197, 102, 105, 18, 67, 219, 69, 138, 213, 50, 45, 156, 108, 102, 34,
+    147, 232, 183, 14, 225, 156, 101, 186, 7, 158, 243,
+];
 
 mod crypto;
 use crypto::*;
@@ -42,7 +46,6 @@ struct InitSent {
 struct InitReceived {
     ephemeral_public_initiator: PublicKey,
     index_initiator: u32,
-    timestamp_initiator: Tai64N,
 
     constr: [u8; 32],
     h: [u8; 32],
@@ -69,15 +72,12 @@ impl Handshake<Created> {
     /// Parses a received handshake initiator message
     pub fn receive(self, received: HandshakeInitMsg) -> Handshake<InitReceived> {
         let constr = INITIAL_CONSTR_HASH;
-        let h = hash(&[
-            INITIAL_IDENTIFIER_HASH,
-            self.our_public.as_ref(),
-        ]);
+        let h = hash(&[INITIAL_IDENTIFIER_HASH, self.our_public.as_ref()]);
         let ephemeral_public_initiator = received.ephemeral_public_key;
-        let constr = kdf::<1>(&constr, &ephemeral_public_initiator.as_ref())[0];
+        let constr = kdf::<1>(constr, ephemeral_public_initiator.as_ref())[0];
         let h = hash(&[h.as_ref(), ephemeral_public_initiator.as_ref()]);
         let shared_secret = self.our_private.diffie_hellman(&ephemeral_public_initiator);
-        let [constr, key] = kdf::<2>(&constr, &shared_secret.as_ref());
+        let [constr, key] = kdf::<2>(&constr, shared_secret.as_ref());
         let mut aead = ChaCha20Poly1305::new(&key.into());
 
         // copied because the encrypted bytes are used in the hash after open
@@ -91,7 +91,7 @@ impl Handshake<Created> {
         let h = hash(&[h.as_ref(), &received.encrypted_static_public_key]);
 
         let shared_secret = self.our_private.diffie_hellman(&self.peer_public);
-        let [constr, key] = kdf::<2>(&constr, &shared_secret.as_ref());
+        let [constr, key] = kdf::<2>(&constr, shared_secret.as_ref());
         let mut aead = ChaCha20Poly1305::new(&key.into());
 
         // copied because the encrypted bytes are used in the hash after open
@@ -99,7 +99,6 @@ impl Handshake<Created> {
         timestamp_buf.copy_from_slice(&received.encrypted_timestamp[..12]);
         let tag = &received.encrypted_timestamp[12..];
         aead_open(&mut aead, 0, h.as_ref(), &mut timestamp_buf, tag).unwrap();
-        let timestamp_initiator = Tai64N::from_slice(&timestamp_buf).unwrap();
         let h = hash(&[h.as_ref(), &received.encrypted_timestamp]);
 
         Handshake {
@@ -109,7 +108,6 @@ impl Handshake<Created> {
             state: InitReceived {
                 ephemeral_public_initiator,
                 index_initiator: received.sender,
-                timestamp_initiator,
 
                 constr,
                 h,
@@ -134,13 +132,10 @@ impl Handshake<Created> {
         hw: &mut impl HandshakeMessageWriter,
     ) -> Handshake<InitSent> {
         let constr = INITIAL_CONSTR_HASH;
-        let h = hash(&[
-            INITIAL_IDENTIFIER_HASH,
-            self.peer_public.as_ref(),
-        ]);
+        let h = hash(&[INITIAL_IDENTIFIER_HASH, self.peer_public.as_ref()]);
         let ephemeral_public_key = PublicKey::from(&ephemeral_secret);
 
-        let constr = kdf::<1>(&constr, &ephemeral_public_key.as_ref())[0];
+        let constr = kdf::<1>(constr, ephemeral_public_key.as_ref())[0];
         let h = hash(&[h.as_ref(), ephemeral_public_key.as_ref()]);
         let shared_secret = ephemeral_secret.diffie_hellman(&self.peer_public);
         let [constr, key] = kdf::<2>(&constr, shared_secret.as_ref());
@@ -216,7 +211,7 @@ impl Handshake<InitReceived> {
             sender: index,
             receiver: self.state.index_initiator,
             ephemeral_public_key: ephemeral_public,
-            encrypted_empty_tag: encrypted_empty_tag,
+            encrypted_empty_tag,
             mac_1: [0u8; 16],
             mac_2: [0u8; 16],
         }));
@@ -341,13 +336,14 @@ mod test {
         let constr = hash(&[CONSTRUCTION_STR.as_bytes()]);
         assert_eq!(
             constr.as_ref(),
-            INITIAL_CONSTR_HASH, "construction hash mismatch");
-        let h = hash(&[
-            constr.as_ref(),
-            IDENTIFIER_STR.as_bytes(),
-        ]);
+            INITIAL_CONSTR_HASH,
+            "construction hash mismatch"
+        );
+        let h = hash(&[constr.as_ref(), IDENTIFIER_STR.as_bytes()]);
         assert_eq!(
             h.as_ref(),
-            INITIAL_IDENTIFIER_HASH, "identifier hash mismatch");
+            INITIAL_IDENTIFIER_HASH,
+            "identifier hash mismatch"
+        );
     }
 }

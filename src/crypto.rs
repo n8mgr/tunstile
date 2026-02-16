@@ -4,7 +4,6 @@ use chacha20poly1305::{
     aead::{self, AeadMutInPlace},
 };
 use hmac::{Mac, SimpleHmac};
-use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 type HMACBlake2s256 = SimpleHmac<Blake2s256>;
 
@@ -96,9 +95,7 @@ pub(crate) fn hmac(key: &[u8], input: &[&[u8]]) -> [u8; 32] {
 
 /// Derives keys from a shared secret using the KDF algorithm
 ///
-/// ```
 /// Kdfn(key, input) Sets τ0 := Hmac(key,input),τ1 := Hmac(τ0,0x1),τi := Hmac(τ0,τi−1 ∥i), and returns an n-tuple of 32 byte values, (τ1,...,τn).
-/// ```
 pub(crate) fn kdf<const N: usize>(key: &[u8], input: &[u8]) -> [[u8; 32]; N] {
     if N == 0 || N > u8::MAX as usize {
         panic!("invalid number of keys")
