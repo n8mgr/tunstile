@@ -2,10 +2,15 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 use tai64::Tai64N;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const CONSTRUCTION_STR: &'static str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
-const IDENTIFIER_STR: &'static str = "WireGuard v1 zx2c4 Jason@zx2c4.com";
 const LABEL_MAC_1: &'static str = "mac1----";
 const LABEL_COOKIE: &'static str = "cookie--";
+
+// C := HASH(Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s)
+const INITIAL_CONSTR_HASH: &[u8] = &[
+    96, 226, 109, 174, 243, 39, 239, 192, 46, 195, 53, 226, 160, 37, 210, 208, 22, 235, 66, 6, 248, 114, 119, 245, 45, 56, 209, 152, 139, 120, 205, 54];
+
+// H := HASH(C || WireGuard v1 zx2c4 Jason@zx2c4.com)
+const INITIAL_IDENTIFIER_HASH: &[u8] = &[34, 17, 179, 97, 8, 26, 197, 102, 105, 18, 67, 219, 69, 138, 213, 50, 45, 156, 108, 102, 34, 147, 232, 183, 14, 225, 156, 101, 186, 7, 158, 243];
 
 mod crypto;
 use crypto::*;
@@ -63,10 +68,9 @@ impl Handshake<Created> {
 
     /// Parses a received handshake initiator message
     pub fn receive(self, received: HandshakeInitMsg) -> Handshake<InitReceived> {
-        let constr = hash(&[CONSTRUCTION_STR.as_bytes()]);
+        let constr = INITIAL_CONSTR_HASH;
         let h = hash(&[
-            constr.as_ref(),
-            IDENTIFIER_STR.as_bytes(),
+            INITIAL_IDENTIFIER_HASH,
             self.our_public.as_ref(),
         ]);
         let ephemeral_public_initiator = received.ephemeral_public_key;
@@ -129,10 +133,9 @@ impl Handshake<Created> {
         timestamp: Tai64N,
         hw: &mut impl HandshakeMessageWriter,
     ) -> Handshake<InitSent> {
-        let constr = hash(&[CONSTRUCTION_STR.as_bytes()]);
+        let constr = INITIAL_CONSTR_HASH;
         let h = hash(&[
-            constr.as_ref(),
-            IDENTIFIER_STR.as_bytes(),
+            INITIAL_IDENTIFIER_HASH,
             self.peer_public.as_ref(),
         ]);
         let ephemeral_public_key = PublicKey::from(&ephemeral_secret);
@@ -328,5 +331,23 @@ mod test {
         assert_eq!(h_init.state.our_index, h_resp.state.peer_index);
         assert_eq!(h_init.state.peer_index, h_resp.state.our_index);
         assert_eq!(h_init.state.constr, h_resp.state.constr);
+    }
+
+    #[test]
+    fn test_precalculated_hash() {
+        const CONSTRUCTION_STR: &'static str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+        const IDENTIFIER_STR: &'static str = "WireGuard v1 zx2c4 Jason@zx2c4.com";
+
+        let constr = hash(&[CONSTRUCTION_STR.as_bytes()]);
+        assert_eq!(
+            constr.as_ref(),
+            INITIAL_CONSTR_HASH, "construction hash mismatch");
+        let h = hash(&[
+            constr.as_ref(),
+            IDENTIFIER_STR.as_bytes(),
+        ]);
+        assert_eq!(
+            h.as_ref(),
+            INITIAL_IDENTIFIER_HASH, "identifier hash mismatch");
     }
 }
