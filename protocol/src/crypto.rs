@@ -116,7 +116,7 @@ mod test {
     #[test]
     fn kdf_vectors() {
         // taken from https://github.com/WireGuard/wireguard-go/blob/f333402bd9cbe0f3eeb02507bd14e23d7d639280/device/kdf_test.go#L29
-        let tests: Vec<(&[u8], &[u8], [u8; 32], [u8; 32], [u8; 32])> = vec![
+        let tests: &[(&[u8], &[u8], [u8; 32], [u8; 32], [u8; 32])] = &[
             (
                 &[0x74, 0x65, 0x73, 0x74, 0x2d, 0x6b, 0x65, 0x79],
                 &[0x74, 0x65, 0x73, 0x74, 0x2d, 0x69, 0x6e, 0x70, 0x75, 0x74],

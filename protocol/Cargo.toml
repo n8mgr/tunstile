@@ -1,0 +1,15 @@
+[package]
+name = "spacetun-protocol"
+version = "0.0.1"
+edition = "2024"
+description = "A pure Rust implementation of the Wireguard protocol"
+license = "MIT"
+repository = "https://github.com/n8mgr/spacetun"
+keywords = ["wireguard", "vpn", "tunnel", "networking", "no_std"]
+
+[dependencies]
+blake2 = "0.10.6"
+chacha20poly1305 = "0.10.1"
+hmac = "0.12.1"
+tai64 = { version = "4.1.0", default-features = false }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets", "getrandom"] }
