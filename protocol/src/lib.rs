@@ -1,6 +1,8 @@
 #![no_std]
 
-mod cookies;
 mod crypto;
-mod handshake;
 mod messages;
+mod transport;
+
+pub mod cookies;
+pub mod handshake;

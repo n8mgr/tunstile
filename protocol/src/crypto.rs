@@ -1,19 +1,54 @@
+use core::{
+    array,
+    ops::{Deref, DerefMut},
+};
+
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::{
-    ChaCha20Poly1305, KeyInit, XChaCha20Poly1305,
+    ChaCha20Poly1305, XChaCha20Poly1305,
     aead::{self, AeadMutInPlace},
 };
 use hmac::{Mac, SimpleHmac};
+use zeroize::ZeroizeOnDrop;
 
 type HMACBlake2s256 = SimpleHmac<Blake2s256>;
 
+#[derive(ZeroizeOnDrop, Default, Debug, PartialEq)]
+pub(crate) struct Hash256([u8; 32]);
+
+impl From<[u8; 32]> for Hash256 {
+    fn from(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<[u8]> for Hash256 {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Deref for Hash256 {
+    type Target = [u8; 32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Hash256 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Hashes an array of inputs using the Blake2s256 algorithm
-pub(crate) fn hash(input: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn hash(input: &[&[u8]]) -> Hash256 {
     let mut h = Blake2s256::new();
     for input in input {
         h.update(input);
     }
-    h.finalize().into()
+    Hash256(h.finalize().into())
 }
 
 /// Encrypts data using ChaCha20Poly1305 with a given counter and authentication text
@@ -52,6 +87,7 @@ pub(crate) fn aead_open(
 /// Encrypts data using XChaCha20Poly1305 with a given nonce and authentication text
 /// The plain text is encrypted in place. `data` must be large enough to hold the 16 byte
 /// authentication tag.
+#[allow(unused)] // TODO: implement cookies
 pub(crate) fn xaead_seal(
     cipher: &mut XChaCha20Poly1305,
     nonce: [u8; 24],
@@ -67,6 +103,7 @@ pub(crate) fn xaead_seal(
 
 /// Decrypts data using XChaCha20Poly1305 with a given nonce and authentication text
 /// The cipher text is decrypted in place.
+#[allow(unused)] // TODO: implement cookies
 pub(crate) fn xaead_open(
     cipher: &mut XChaCha20Poly1305,
     nonce: [u8; 24],
@@ -78,33 +115,35 @@ pub(crate) fn xaead_open(
 }
 
 /// Computes a 16 byte MAC using the Blake2s256 in keyed mode.
-pub(crate) fn mac(key: &[u8; 32], input: &[u8]) -> [u8; 16] {
+pub(crate) fn mac(key: &[u8], input: &[&[u8]]) -> [u8; 16] {
     let mut h = <Blake2sMac<_> as Mac>::new(key.into());
-    h.update(input);
-    h.finalize().into_bytes().into()
-}
-
-/// Computes a 32 byte MAC using HMAC+Blake2s256.
-pub(crate) fn hmac(key: &[u8], input: &[&[u8]]) -> [u8; 32] {
-    let mut h = <HMACBlake2s256 as Mac>::new_from_slice(key).unwrap(); // key is fixed size
     for input in input {
         h.update(input);
     }
     h.finalize().into_bytes().into()
 }
 
+/// Computes a 32 byte MAC using HMAC+Blake2s256.
+pub(crate) fn hmac(key: &[u8], input: &[&[u8]]) -> Hash256 {
+    let mut h = <HMACBlake2s256 as Mac>::new_from_slice(key).unwrap(); // key is fixed size
+    for input in input {
+        h.update(input);
+    }
+    Hash256(h.finalize().into_bytes().into())
+}
+
 /// Derives keys from a shared secret using the KDF algorithm
 ///
 /// Kdfn(key, input) Sets τ0 := Hmac(key,input),τ1 := Hmac(τ0,0x1),τi := Hmac(τ0,τi−1 ∥i), and returns an n-tuple of 32 byte values, (τ1,...,τn).
-pub(crate) fn kdf<const N: usize>(key: &[u8], input: &[u8]) -> [[u8; 32]; N] {
+pub(crate) fn kdf<const N: usize>(key: &[u8], input: &[u8]) -> [Hash256; N] {
     if N == 0 || N > u8::MAX as usize {
         panic!("invalid number of keys")
     }
     let t0 = hmac(key, &[input]);
-    let mut out = [[0u8; 32]; N];
-    out[0] = hmac(&t0, &[&[1u8]]);
+    let mut out = array::from_fn(|_| Hash256::default());
+    out[0] = hmac(t0.as_ref(), &[&[1u8]]);
     for i in 1..N {
-        out[i] = hmac(&t0, &[&out[i - 1], &[(i + 1) as u8]]);
+        out[i] = hmac(t0.as_ref(), &[out[i - 1].as_ref(), &[(i + 1) as u8]]);
     }
     out
 }
@@ -177,7 +216,7 @@ mod test {
         ];
 
         for (key, input, t0, t1, t2) in tests {
-            let tt0 = kdf::<1>(&key, input)[0];
+            let [tt0] = kdf::<1>(&key, input);
             assert_eq!(tt0[..], t0[..], "kdf1");
 
             let [tt0, tt1] = kdf::<2>(&key, input);

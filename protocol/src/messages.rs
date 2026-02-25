@@ -1,16 +1,13 @@
 use x25519_dalek::PublicKey;
+use zeroize::ZeroizeOnDrop;
 
 const AEAD_TAG_SIZE: usize = 16;
 
-pub trait HandshakeMessageWriter {
-    fn write_message(&mut self, msg: HandshakeMessage);
+pub trait MessageWriter {
+    fn write_message(&mut self, msg: &[u8]);
 }
 
-pub enum HandshakeMessage {
-    Init(HandshakeInitMsg),
-    Response(HandshakeResponseMsg),
-}
-
+#[derive(ZeroizeOnDrop)]
 pub struct HandshakeInitMsg {
     pub sender: u32,
     pub ephemeral_public_key: PublicKey,
@@ -24,7 +21,8 @@ impl HandshakeInitMsg {
     pub const MESSAGE_TYPE: u8 = 0x01;
     pub const MESSAGE_LENGTH: usize = 4 + 4 + 32 + 48 + 28 + 16 + 16;
 
-    pub fn encode(&self, buf: &mut [u8; Self::MESSAGE_LENGTH]) {
+    pub fn encode(&self) -> [u8; Self::MESSAGE_LENGTH] {
+        let mut buf = [0u8; Self::MESSAGE_LENGTH];
         buf[0] = Self::MESSAGE_TYPE;
         buf[1..4].fill(0); // reserved
         buf[4..8].copy_from_slice(&self.sender.to_le_bytes());
@@ -33,6 +31,7 @@ impl HandshakeInitMsg {
         buf[88..116].copy_from_slice(&self.encrypted_timestamp);
         buf[116..132].copy_from_slice(&self.mac_1);
         buf[132..148].copy_from_slice(&self.mac_2);
+        buf
     }
 
     pub fn decode(buf: &[u8; Self::MESSAGE_LENGTH]) -> Self {
@@ -53,6 +52,7 @@ impl HandshakeInitMsg {
     }
 }
 
+#[derive(ZeroizeOnDrop)]
 pub struct HandshakeResponseMsg {
     pub sender: u32,
     pub receiver: u32,
@@ -66,7 +66,8 @@ impl HandshakeResponseMsg {
     pub const MESSAGE_TYPE: u8 = 0x02;
     pub const MESSAGE_LENGTH: usize = 4 + 4 + 4 + 32 + 16 + 16 + 16;
 
-    pub fn encode(&self, buf: &mut [u8; Self::MESSAGE_LENGTH]) {
+    pub fn encode(&self) -> [u8; Self::MESSAGE_LENGTH] {
+        let mut buf = [0u8; Self::MESSAGE_LENGTH];
         buf[0] = Self::MESSAGE_TYPE;
         buf[1..4].fill(0); // reserved
         buf[4..8].copy_from_slice(&self.sender.to_le_bytes());
@@ -75,6 +76,7 @@ impl HandshakeResponseMsg {
         buf[44..60].copy_from_slice(&self.encrypted_empty_tag);
         buf[60..76].copy_from_slice(&self.mac_1);
         buf[76..92].copy_from_slice(&self.mac_2);
+        buf
     }
 
     pub fn decode(buf: &[u8; Self::MESSAGE_LENGTH]) -> Self {
@@ -98,5 +100,5 @@ impl HandshakeResponseMsg {
 pub struct TransportDataMsg<'a> {
     pub receiver: u32,
     pub counter: u64,
-    pub packet: &'a [u8],
+    pub packet: &'a mut [u8],
 }
