@@ -6,3 +6,6 @@ pub mod transport;
 
 pub mod cookies;
 pub mod handshake;
+
+pub use tai64::*;
+pub use x25519_dalek::{PublicKey, StaticSecret};

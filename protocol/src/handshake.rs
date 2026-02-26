@@ -325,7 +325,10 @@ impl Handshake<InitiatorEstablished> {
 
 #[cfg(test)]
 mod test {
+    extern crate alloc;
+
     use crate::{cookies::Verifier, messages::TransportDataMsg};
+    use alloc::vec;
 
     use super::*;
 
@@ -375,7 +378,7 @@ mod test {
         );
         assert!(cv_resp.verify_mac_1(&Tai64N::UNIX_EPOCH, &resp_msg)); // TODO: set timestamp
         let resp_msg = HandshakeResponseMsg::decode(&resp_msg);
-
+        
         assert_eq!(resp_msg.sender, RECEIVER);
         assert_eq!(resp_msg.receiver, INITIATOR);
 
@@ -386,7 +389,8 @@ mod test {
         let mut t_resp = h_resp.finish();
 
         const INITIATOR_DATA: &[u8] = b"Hello, World!";
-        let mut init_msg = [0u8; TransportDataMsg::encoded_len(INITIATOR_DATA.len())];
+
+        let mut init_msg = vec![0u8; TransportDataMsg::encoded_len(INITIATOR_DATA.len())];
         t_init.send(INITIATOR_DATA, &mut init_msg);
 
         let init_msg = TransportDataMsg::decode(&mut init_msg);
@@ -397,7 +401,7 @@ mod test {
         assert_eq!(recv_data, INITIATOR_DATA);
 
         const RECEIVER_DATA: &[u8] = b"Goodbye, World!";
-        let mut recv_msg = [0u8; TransportDataMsg::encoded_len(RECEIVER_DATA.len())];
+        let mut recv_msg = vec![0u8; TransportDataMsg::encoded_len(RECEIVER_DATA.len())];
         t_resp.send(RECEIVER_DATA, &mut recv_msg);
 
         let recv_msg = TransportDataMsg::decode(&mut recv_msg);

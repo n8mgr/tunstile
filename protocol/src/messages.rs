@@ -128,7 +128,7 @@ impl<'a> TransportDataMsg<'a> {
     pub(crate) const COUNTER: Range<usize> = Self::RECEIVER.end..Self::RECEIVER.end + 8;
     pub(crate) const PAYLOAD_OFFSET: usize = Self::COUNTER.end;
 
-    pub const fn encoded_len(payload_len: usize) -> usize {
+    pub fn encoded_len(payload_len: usize) -> usize {
         Self::PAYLOAD_OFFSET + payload_len + AEAD_TAG_SIZE
     }
 

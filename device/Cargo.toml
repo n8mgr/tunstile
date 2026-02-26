@@ -6,3 +6,7 @@ description = "A pure Rust implementation of the Wireguard protocol"
 license = "MIT"
 repository = "https://github.com/n8mgr/spacetun"
 keywords = ["wireguard", "vpn", "tunnel", "networking"]
+
+[dependencies]
+hex = "0.4.3"
+spacetun-protocol = { path = "../protocol", features = ["std"] }
