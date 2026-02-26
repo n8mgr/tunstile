@@ -1,3 +1,4 @@
+use etherparse::PacketBuilder;
 use spacetun_protocol::{
     PublicKey, StaticSecret, Tai64N,
     cookies::Generator,
@@ -45,9 +46,13 @@ fn main() {
     println!("handshake complete");
 
     // Send a transport packet
-    let payload = b"hello from rust";
-    let mut transport_buf = vec![0u8; TransportDataMsg::encoded_len(payload.len())];
-    transport.send(payload, &mut transport_buf);
+    let builder = PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(12345, 12345);
+
+    let mut ip_pkt = Vec::new();
+    builder.write(&mut ip_pkt, b"hello from rust").unwrap();
+
+    let mut transport_buf = vec![0u8; TransportDataMsg::encoded_len(ip_pkt.len())];
+    transport.send(&ip_pkt, &mut transport_buf);
     socket.send_to(&transport_buf, go_addr).unwrap();
     println!("sent transport packet ({} bytes)", transport_buf.len());
 }

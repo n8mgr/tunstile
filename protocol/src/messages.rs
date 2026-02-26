@@ -121,7 +121,7 @@ pub struct TransportDataMsg<'a> {
 }
 
 impl<'a> TransportDataMsg<'a> {
-    pub const MESSAGE_TYPE: u8 = 0x03;
+    pub const MESSAGE_TYPE: u8 = 0x04;
 
     // wire layout: [type(1) | reserved(3) | receiver(4) | counter(8) | payload+tag(...)]
     pub(crate) const RECEIVER: Range<usize> = 4..8;
