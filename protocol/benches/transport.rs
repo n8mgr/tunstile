@@ -47,14 +47,14 @@ fn complete_handshake() -> (Transport, Transport) {
 }
 
 const PAYLOAD_LEN: usize = 1400;
-const WIRE_LEN: usize = TransportDataMsg::encoded_len(PAYLOAD_LEN);
 
 fn bench_transport_send(c: &mut Criterion) {
+    let wire_len = TransportDataMsg::encoded_len(PAYLOAD_LEN);
     let (mut t_init, _t_resp) = complete_handshake();
 
     c.bench_function("transport_send_1400b", |b| {
         let payload = [0xABu8; PAYLOAD_LEN];
-        let mut buf = [0u8; WIRE_LEN];
+        let mut buf = vec![0u8; wire_len];
         b.iter(|| {
             t_init.send(&payload, &mut buf);
         });
@@ -62,13 +62,14 @@ fn bench_transport_send(c: &mut Criterion) {
 }
 
 fn bench_transport_receive(c: &mut Criterion) {
+    let wire_len = TransportDataMsg::encoded_len(PAYLOAD_LEN);
     let (mut t_init, mut t_resp) = complete_handshake();
 
     c.bench_function("transport_receive_1400b", |b| {
         b.iter_batched(
             || {
                 let payload = [0xABu8; PAYLOAD_LEN];
-                let mut buf = [0u8; WIRE_LEN];
+                let mut buf = vec![0u8; wire_len];
                 t_init.send(&payload, &mut buf);
                 buf
             },
