@@ -1,19 +1,23 @@
-use chacha20poly1305::ChaCha20Poly1305;
-use zeroize::ZeroizeOnDrop;
+use core::ops::Range;
+use ring::aead::LessSafeKey;
 
 use crate::{
+    AEAD_TAG_SIZE, MessageType,
     crypto::{aead_open, aead_seal},
-    messages::TransportDataMsg,
 };
 
-#[derive(ZeroizeOnDrop)]
+// data msg wire layout: [type(1) | reserved(3) | receiver(4) | counter(8) | payload+tag(...)]
+pub(crate) const DATA_RECEIVER: Range<usize> = 4..8;
+pub(crate) const DATA_COUNTER: Range<usize> = DATA_RECEIVER.end..DATA_RECEIVER.end + 8;
+const DATA_PAYLOAD_OFFSET: usize = DATA_COUNTER.end;
+
 pub struct Transport {
     our_index: u32,
     peer_index: u32,
 
-    recv_aead: ChaCha20Poly1305,
+    recv_aead: LessSafeKey,
     // TODO: replay protection
-    send_aead: ChaCha20Poly1305,
+    send_aead: LessSafeKey,
     send_counter: u64,
 }
 
@@ -21,8 +25,8 @@ impl Transport {
     pub(crate) fn new(
         our_index: u32,
         peer_index: u32,
-        recv_aead: ChaCha20Poly1305,
-        send_aead: ChaCha20Poly1305,
+        recv_aead: LessSafeKey,
+        send_aead: LessSafeKey,
     ) -> Self {
         Self {
             our_index,
@@ -37,31 +41,45 @@ impl Transport {
 
     /// Writes an encrypted transport data message to the given buffer.
     pub fn send(&mut self, payload: &[u8], buf: &mut [u8]) {
-        use TransportDataMsg as M;
-        if buf.len() != M::encoded_len(payload.len()) {
+        if buf.len() != Self::packet_len(payload.len()) {
             panic!("buffer size mismatch");
         }
-        buf[0] = M::MESSAGE_TYPE;
+        buf[0] = MessageType::Data as u8;
         buf[1..4].fill(0);
-        buf[M::RECEIVER].copy_from_slice(&self.peer_index.to_le_bytes());
-        buf[M::COUNTER].copy_from_slice(&self.send_counter.to_le_bytes());
-        buf[M::PAYLOAD_OFFSET..M::PAYLOAD_OFFSET + payload.len()].copy_from_slice(payload);
+        buf[DATA_RECEIVER].copy_from_slice(&self.peer_index.to_le_bytes());
+        buf[DATA_COUNTER].copy_from_slice(&self.send_counter.to_le_bytes());
+        buf[DATA_PAYLOAD_OFFSET..DATA_PAYLOAD_OFFSET + payload.len()].copy_from_slice(payload);
         aead_seal(
             &mut self.send_aead,
             self.send_counter,
             &[],
-            &mut buf[M::PAYLOAD_OFFSET..],
+            &mut buf[DATA_PAYLOAD_OFFSET..],
         );
 
         self.send_counter += 1;
     }
 
+    pub const fn packet_len(payload_size: usize) -> usize {
+        DATA_PAYLOAD_OFFSET + payload_size + AEAD_TAG_SIZE
+    }
+
     /// Decrypts a received encrypted transport data message
-    pub fn receive<'a>(&mut self, packet: TransportDataMsg<'a>) -> Result<&'a [u8], bool> {
-        let (cipher_text, tag) = packet
-            .encrypted_payload
-            .split_at_mut(packet.encrypted_payload.len() - 16);
-        aead_open(&mut self.recv_aead, packet.counter, &[], cipher_text, tag).map_err(|_| false)?;
-        Ok(cipher_text)
+    pub fn receive<'a>(&mut self, packet: &'a mut [u8]) -> Result<&'a [u8], ()> {
+        if MessageType::try_from(packet[0]) != Ok(MessageType::Data) {
+            return Err(());
+        }
+        let receiver = u32::from_le_bytes(packet[DATA_RECEIVER].try_into().map_err(|_| ())?);
+        if receiver != self.our_index {
+            return Err(());
+        }
+        let counter = u64::from_le_bytes(packet[DATA_COUNTER].try_into().map_err(|_| ())?);
+        let plaintext = aead_open(
+            &self.recv_aead,
+            counter,
+            &[],
+            &mut packet[DATA_PAYLOAD_OFFSET..],
+        )
+        .map_err(|_| ())?;
+        Ok(plaintext)
     }
 }

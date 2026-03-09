@@ -1,7 +1,52 @@
 #![no_std]
 
+const AEAD_TAG_SIZE: usize = 16;
+const MAC_SIZE: usize = 16;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum MessageType {
+    HandshakeInit = 0x01,
+    HandshakeResp = 0x02,
+    Cookie = 0x03,
+    Data = 0x04,
+}
+
+impl TryFrom<u8> for MessageType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            x if x == MessageType::HandshakeInit as u8 => Ok(MessageType::HandshakeInit),
+            x if x == MessageType::HandshakeResp as u8 => Ok(MessageType::HandshakeResp),
+            x if x == MessageType::Cookie as u8 => Ok(MessageType::Cookie),
+            x if x == MessageType::Data as u8 => Ok(MessageType::Data),
+            _ => Err(()),
+        }
+    }
+}
+
+pub struct MessageHeader {
+    pub msg_type: MessageType,
+    pub peer_index: u32,
+}
+
+impl TryFrom<&[u8]> for MessageHeader {
+    type Error = ();
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() < 5 {
+            return Err(());
+        }
+        let msg_type = MessageType::try_from(value[0])?;
+        let peer_index = u32::from_be_bytes(value[1..5].try_into().map_err(|_| ())?);
+        Ok(MessageHeader {
+            msg_type,
+            peer_index,
+        })
+    }
+}
+
 mod crypto;
-pub mod messages;
 pub mod transport;
 
 pub mod cookies;
