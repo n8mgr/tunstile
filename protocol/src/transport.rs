@@ -1,5 +1,6 @@
 use core::ops::Range;
 use ring::aead::LessSafeKey;
+use thiserror::Error;
 
 use crate::{
     AEAD_TAG_SIZE, MessageType,
@@ -10,6 +11,12 @@ use crate::{
 pub(crate) const DATA_RECEIVER: Range<usize> = 4..8;
 pub(crate) const DATA_COUNTER: Range<usize> = DATA_RECEIVER.end..DATA_RECEIVER.end + 8;
 const DATA_PAYLOAD_OFFSET: usize = DATA_COUNTER.end;
+
+#[derive(Debug, Error)]
+pub enum TransportError {
+    #[error("invalid packet")]
+    InvalidPacket,
+}
 
 pub struct Transport {
     our_index: u32,
@@ -50,7 +57,7 @@ impl Transport {
         buf[DATA_COUNTER].copy_from_slice(&self.send_counter.to_le_bytes());
         buf[DATA_PAYLOAD_OFFSET..DATA_PAYLOAD_OFFSET + payload.len()].copy_from_slice(payload);
         aead_seal(
-            &mut self.send_aead,
+            &self.send_aead,
             self.send_counter,
             &[],
             &mut buf[DATA_PAYLOAD_OFFSET..],
@@ -64,22 +71,30 @@ impl Transport {
     }
 
     /// Decrypts a received encrypted transport data message
-    pub fn receive<'a>(&mut self, packet: &'a mut [u8]) -> Result<&'a [u8], ()> {
+    pub fn receive<'a>(&mut self, packet: &'a mut [u8]) -> Result<&'a [u8], TransportError> {
         if MessageType::try_from(packet[0]) != Ok(MessageType::Data) {
-            return Err(());
+            return Err(TransportError::InvalidPacket);
         }
-        let receiver = u32::from_le_bytes(packet[DATA_RECEIVER].try_into().map_err(|_| ())?);
+        let receiver = u32::from_le_bytes(
+            packet[DATA_RECEIVER]
+                .try_into()
+                .map_err(|_| TransportError::InvalidPacket)?,
+        );
         if receiver != self.our_index {
-            return Err(());
+            return Err(TransportError::InvalidPacket);
         }
-        let counter = u64::from_le_bytes(packet[DATA_COUNTER].try_into().map_err(|_| ())?);
+        let counter = u64::from_le_bytes(
+            packet[DATA_COUNTER]
+                .try_into()
+                .map_err(|_| TransportError::InvalidPacket)?,
+        );
         let plaintext = aead_open(
             &self.recv_aead,
             counter,
             &[],
             &mut packet[DATA_PAYLOAD_OFFSET..],
         )
-        .map_err(|_| ())?;
+        .map_err(|_| TransportError::InvalidPacket)?;
         Ok(plaintext)
     }
 }

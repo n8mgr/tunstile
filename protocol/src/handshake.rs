@@ -2,6 +2,7 @@ use core::ops::Range;
 
 use ring::aead::{CHACHA20_POLY1305, LessSafeKey, UnboundKey};
 use tai64::Tai64N;
+use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::ZeroizeOnDrop;
 
@@ -47,6 +48,12 @@ const RESP_MAC1: Range<usize> =
 const RESP_MAC2: Range<usize> = RESP_MAC1.end..RESP_MAC1.end + MAC_SIZE;
 
 pub const RESP_MSG_LENGTH: usize = RESP_MAC2.end;
+
+#[derive(Debug, Error)]
+pub enum HandshakeError {
+    #[error("failed")]
+    Failed,
+}
 
 pub struct Handshake<S> {
     our_private: StaticSecret,
@@ -107,16 +114,21 @@ impl Handshake<Created> {
     /// Parses a received handshake initiator message
     ///
     /// Returns an error if the packet is not a valid handshake initiator message.
-    pub fn receive(self, packet: &mut [u8]) -> Result<Handshake<InitReceived>, ()> {
-        if packet.len() < INIT_MSG_LENGTH {
-            return Err(());
-        } else if MessageType::try_from(packet[0]) != Ok(MessageType::HandshakeInit) {
-            return Err(());
+    pub fn receive(self, packet: &mut [u8]) -> Result<Handshake<InitReceived>, HandshakeError> {
+        if packet.len() < INIT_MSG_LENGTH
+            || MessageType::try_from(packet[0]) != Ok(MessageType::HandshakeInit)
+        {
+            return Err(HandshakeError::Failed);
         }
 
-        let sender = u32::from_le_bytes(packet[INIT_SENDER].try_into().map_err(|_| ())?);
-        let ephemeral_public_key =
-            PublicKey::from(<[u8; 32]>::try_from(&packet[INIT_EPHEMERAL_PK]).map_err(|_| ())?);
+        let sender = u32::from_le_bytes(
+            packet[INIT_SENDER]
+                .try_into()
+                .map_err(|_| HandshakeError::Failed)?,
+        );
+        let ephemeral_public_key = PublicKey::from(
+            <[u8; 32]>::try_from(&packet[INIT_EPHEMERAL_PK]).map_err(|_| HandshakeError::Failed)?,
+        );
 
         let constr = INITIAL_CONSTR_HASH;
         let h = hash(&[INITIAL_IDENTIFIER_HASH, self.our_public.as_ref()]);
@@ -128,9 +140,10 @@ impl Handshake<Created> {
         let static_pk_buf = &mut packet[INIT_ENCRYPTED_STATIC_PK];
         let h_temp = hash(&[h.as_ref(), static_pk_buf]); // hash is computed based on the encrypted bytes
         // decrypt in place and verify the static public key matches the peer
-        aead_open(&init_aead(&key), 0, h.as_ref(), static_pk_buf).map_err(|_| ())?;
+        aead_open(&init_aead(&key), 0, h.as_ref(), static_pk_buf)
+            .map_err(|_| HandshakeError::Failed)?;
         if self.peer_public.to_bytes() != static_pk_buf[..32] {
-            return Err(());
+            return Err(HandshakeError::Failed);
         }
         let h = h_temp;
 
@@ -139,7 +152,8 @@ impl Handshake<Created> {
 
         let timestamp_buf = &mut packet[INIT_ENCRYPTED_TIMESTAMP];
         let h_temp = hash(&[h.as_ref(), timestamp_buf]); // hash is computed based on the encrypted bytes
-        aead_open(&init_aead(&key), 0, h.as_ref(), timestamp_buf).map_err(|_| ())?;
+        aead_open(&init_aead(&key), 0, h.as_ref(), timestamp_buf)
+            .map_err(|_| HandshakeError::Failed)?;
         let h = h_temp;
 
         Ok(Handshake {
@@ -308,20 +322,29 @@ impl Handshake<InitSent> {
         self,
         preshared_key: Option<[u8; 32]>,
         packet: &mut [u8],
-    ) -> Result<Handshake<InitiatorEstablished>, ()> {
-        if packet.len() != RESP_MSG_LENGTH {
-            return Err(());
-        } else if MessageType::try_from(packet[0]) != Ok(MessageType::HandshakeResp) {
-            return Err(());
+    ) -> Result<Handshake<InitiatorEstablished>, HandshakeError> {
+        if packet.len() != RESP_MSG_LENGTH
+            || MessageType::try_from(packet[0]) != Ok(MessageType::HandshakeResp)
+        {
+            return Err(HandshakeError::Failed);
         }
 
-        let sender = u32::from_le_bytes(packet[RESP_SENDER].try_into().map_err(|_| ())?);
-        let receiver = u32::from_le_bytes(packet[RESP_RECEIVER].try_into().map_err(|_| ())?);
-        let ephemeral_public_key =
-            PublicKey::from(<[u8; 32]>::try_from(&packet[RESP_EPHEMERAL_PK]).map_err(|_| ())?);
+        let sender = u32::from_le_bytes(
+            packet[RESP_SENDER]
+                .try_into()
+                .map_err(|_| HandshakeError::Failed)?,
+        );
+        let receiver = u32::from_le_bytes(
+            packet[RESP_RECEIVER]
+                .try_into()
+                .map_err(|_| HandshakeError::Failed)?,
+        );
+        let ephemeral_public_key = PublicKey::from(
+            <[u8; 32]>::try_from(&packet[RESP_EPHEMERAL_PK]).map_err(|_| HandshakeError::Failed)?,
+        );
 
         if receiver != self.state.index_initiator {
-            return Err(());
+            return Err(HandshakeError::Failed);
         }
         let [constr] = kdf::<1>(self.state.constr.as_ref(), ephemeral_public_key.as_ref());
         let h = hash(&[self.state.h.as_ref(), ephemeral_public_key.as_ref()]);
@@ -345,7 +368,7 @@ impl Handshake<InitSent> {
             h.as_ref(),
             &mut packet[RESP_ENCRYPTED_EMPTY_TAG],
         )
-        .map_err(|_| ())?;
+        .map_err(|_| HandshakeError::Failed)?;
 
         Ok(Handshake {
             our_private: self.our_private,

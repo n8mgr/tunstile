@@ -850,7 +850,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "spacetun-device"
+name = "spacetun_device"
 version = "0.0.1"
 dependencies = [
  "bytes",
@@ -858,12 +858,12 @@ dependencies = [
  "hex",
  "log",
  "rand",
- "spacetun-protocol",
+ "spacetun_protocol",
  "tokio",
 ]
 
 [[package]]
-name = "spacetun-protocol"
+name = "spacetun_protocol"
 version = "0.0.1"
 dependencies = [
  "blake2",
@@ -874,6 +874,7 @@ dependencies = [
  "ring",
  "subtle",
  "tai64",
+ "thiserror",
  "x25519-dalek",
  "zeroize",
 ]
@@ -900,6 +901,26 @@ name = "tai64"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "014639506e4f425c78e823eabf56e71c093f940ae55b43e58f682e7bc2f5887a"
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "tinytemplate"

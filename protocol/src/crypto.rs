@@ -10,6 +10,7 @@ use chacha20poly1305::{
 };
 use hmac::{Mac, SimpleHmac};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+use thiserror::Error;
 use zeroize::ZeroizeOnDrop;
 
 use crate::AEAD_TAG_SIZE;
@@ -84,6 +85,12 @@ pub(crate) fn aead_seal<'a>(
     data
 }
 
+#[derive(Debug, Error)]
+pub enum OpenError {
+    #[error("failed")]
+    Failed,
+}
+
 /// Decrypts data using ChaCha20Poly1305 with a given counter and authentication text
 /// The cipher text is decrypted in place. `data` will be truncated to the length of the
 /// plain text.
@@ -92,7 +99,7 @@ pub(crate) fn aead_open<'a>(
     counter: u64,
     auth_text: &[u8],
     cipher_text: &'a mut [u8],
-) -> Result<&'a mut [u8], ()> {
+) -> Result<&'a mut [u8], OpenError> {
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
 
@@ -101,7 +108,7 @@ pub(crate) fn aead_open<'a>(
         Aad::from(auth_text),
         cipher_text,
     )
-    .map_err(|_| ())
+    .map_err(|_| OpenError::Failed)
 }
 
 /// Encrypts data using XChaCha20Poly1305 with a given nonce and authentication text

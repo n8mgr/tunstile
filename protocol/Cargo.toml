@@ -1,5 +1,5 @@
 [package]
-name = "spacetun-protocol"
+name = "spacetun_protocol"
 version = "0.0.1"
 edition = "2024"
 description = "A Rust implementation of the Wireguard protocol"
@@ -14,6 +14,7 @@ hmac = "0.12.1"
 ring = "0.17.14"
 subtle = { version = "2.6.1", default-features = false }
 tai64 = { version = "4.1.0", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["zeroize", "static_secrets"] }
 zeroize = "1.8.2"
 
@@ -24,7 +25,7 @@ x25519-dalek = { version = "2.0.1", features = ["static_secrets", "getrandom"] }
 
 [features]
 default = []
-std = ["x25519-dalek/getrandom", "tai64/std", "subtle/std", "ring/std"]
+std = ["thiserror/std", "x25519-dalek/getrandom", "tai64/std", "subtle/std", "ring/std"]
 
 [[bench]]
 name = "handshake"
