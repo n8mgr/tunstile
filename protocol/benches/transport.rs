@@ -55,7 +55,7 @@ fn bench_transport(c: &mut Criterion) {
     let (mut t_init, mut t_resp) = complete_handshake();
 
     let mut group = c.benchmark_group("transport");
-    group.throughput(Throughput::Bytes(PAYLOAD_LEN as u64));
+    group.throughput(Throughput::Bits((PAYLOAD_LEN * 8) as u64));
     group.bench_function("send", |b| {
         let payload = [0xABu8; PAYLOAD_LEN];
         let mut buf = vec![0u8; WIRE_LEN];

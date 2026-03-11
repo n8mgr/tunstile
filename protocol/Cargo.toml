@@ -19,7 +19,7 @@ x25519-dalek = { version = "2.0.1", default-features = false, features = ["zeroi
 zeroize = "1.8.2"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 rand = "0.10.0"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets", "getrandom"] }
 
