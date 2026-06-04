@@ -72,7 +72,9 @@ impl Transport {
 
     /// Decrypts a received encrypted transport data message
     pub fn receive<'a>(&mut self, packet: &'a mut [u8]) -> Result<&'a [u8], TransportError> {
-        if MessageType::try_from(packet[0]) != Ok(MessageType::Data) {
+        if packet.len() < Self::packet_len(0)
+            || MessageType::try_from(packet[0]) != Ok(MessageType::Data)
+        {
             return Err(TransportError::InvalidPacket);
         }
         let receiver = u32::from_le_bytes(
