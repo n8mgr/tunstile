@@ -10,7 +10,7 @@ pub enum MessageTypeParseError {
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub enum MessageType {
+enum MessageType {
     HandshakeInit = 0x01,
     HandshakeResp = 0x02,
     Cookie = 0x03,
@@ -46,27 +46,34 @@ pub enum MessageHeaderParseError {
     InvalidPeerIndex,
 }
 
-pub struct MessageHeader {
-    pub msg_type: MessageType,
-    pub peer_index: u32,
+pub enum MessageHeader {
+    HandshakeInit,
+    HandshakeResponse { receiver: u32 },
+    CookieReply { receiver: u32 },
+    Data { receiver: u32 },
 }
 
 impl TryFrom<&[u8]> for MessageHeader {
     type Error = MessageHeaderParseError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() < 5 {
+        if value.is_empty() {
             return Err(MessageHeaderParseError::InvalidLength);
         }
         let msg_type = MessageType::try_from(value[0])?;
-        let peer_index = u32::from_le_bytes(
-            value[1..5]
-                .try_into()
-                .map_err(|_| MessageHeaderParseError::InvalidPeerIndex)?,
-        );
-        Ok(MessageHeader {
-            msg_type,
-            peer_index,
+        let index_range = match msg_type {
+            MessageType::HandshakeInit | MessageType::Cookie | MessageType::Data => 4..8,
+            MessageType::HandshakeResp => 8..12,
+        };
+        if value.len() < index_range.end {
+            return Err(MessageHeaderParseError::InvalidLength);
+        }
+        let index = <u32>::from_le_bytes(value[index_range].try_into().unwrap());
+        Ok(match msg_type {
+            MessageType::HandshakeInit => MessageHeader::HandshakeInit,
+            MessageType::Cookie => MessageHeader::CookieReply { receiver: index },
+            MessageType::HandshakeResp => MessageHeader::HandshakeResponse { receiver: index },
+            MessageType::Data => MessageHeader::Data { receiver: index },
         })
     }
 }

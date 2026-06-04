@@ -63,9 +63,6 @@ pub struct Handshake<S> {
     state: S,
 }
 
-// pre-init state
-pub struct Created;
-
 // initiator state
 #[derive(ZeroizeOnDrop)]
 pub struct InitSent {
@@ -100,21 +97,17 @@ pub struct InitiatorEstablished {
     constr: Hash256,
 }
 
-impl Handshake<Created> {
-    pub fn new(our_private: StaticSecret, peer_public: PublicKey) -> Self {
-        let our_public = PublicKey::from(&our_private);
-        Handshake {
-            our_private,
-            our_public,
-            peer_public,
-            state: Created {},
-        }
+impl Handshake<InitReceived> {
+    /// Returns the peer's public key. It
+    /// is parsed from the handshake initiation.
+    pub fn peer_key(&self) -> PublicKey {
+        self.peer_public
     }
 
     /// Parses a received handshake initiator message
     ///
     /// Returns an error if the packet is not a valid handshake initiator message.
-    pub fn receive(self, packet: &mut [u8]) -> Result<Handshake<InitReceived>, HandshakeError> {
+    pub fn receive(our_private: StaticSecret, packet: &mut [u8]) -> Result<Self, HandshakeError> {
         if packet.len() < INIT_MSG_LENGTH
             || MessageType::try_from(packet[0]) != Ok(MessageType::HandshakeInit)
         {
@@ -131,10 +124,11 @@ impl Handshake<Created> {
         );
 
         let constr = INITIAL_CONSTR_HASH;
-        let h = hash(&[INITIAL_IDENTIFIER_HASH, self.our_public.as_ref()]);
+        let our_public = PublicKey::from(&our_private);
+        let h = hash(&[INITIAL_IDENTIFIER_HASH, our_public.as_ref()]);
         let [constr] = kdf::<1>(constr, ephemeral_public_key.as_ref());
         let h = hash(&[h.as_ref(), ephemeral_public_key.as_ref()]);
-        let shared_secret = self.our_private.diffie_hellman(&ephemeral_public_key);
+        let shared_secret = our_private.diffie_hellman(&ephemeral_public_key);
         let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
 
         let static_pk_buf = &mut packet[INIT_ENCRYPTED_STATIC_PK];
@@ -142,12 +136,13 @@ impl Handshake<Created> {
         // decrypt in place and verify the static public key matches the peer
         aead_open(&init_aead(&key), 0, h.as_ref(), static_pk_buf)
             .map_err(|_| HandshakeError::Failed)?;
-        if self.peer_public.to_bytes() != static_pk_buf[..32] {
-            return Err(HandshakeError::Failed);
-        }
+
+        let mut peer_public = [0u8; 32];
+        peer_public.copy_from_slice(&static_pk_buf[..32]);
+        let peer_public = PublicKey::from(peer_public);
         let h = h_temp;
 
-        let shared_secret = self.our_private.diffie_hellman(&self.peer_public);
+        let shared_secret = our_private.diffie_hellman(&peer_public);
         let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
 
         let timestamp_buf = &mut packet[INIT_ENCRYPTED_TIMESTAMP];
@@ -157,9 +152,9 @@ impl Handshake<Created> {
         let h = h_temp;
 
         Ok(Handshake {
-            our_private: self.our_private,
-            our_public: self.our_public,
-            peer_public: self.peer_public,
+            our_private,
+            our_public,
+            peer_public,
             state: InitReceived {
                 ephemeral_public_initiator: ephemeral_public_key,
                 index_initiator: sender,
@@ -170,83 +165,6 @@ impl Handshake<Created> {
         })
     }
 
-    /// Initiates a handshake with the peer.
-    /// The handshake packet is written to the provided buffer.
-    ///
-    /// # Arguments
-    /// * `sender` - The index of the handshake.
-    /// * `ephemeral_secret` - The ephemeral secret to use for the handshake.
-    /// * `timestamp` - The timestamp to use for the handshake.
-    /// * `cookies` - The cookie generator to use for the handshake.
-    /// * `buf` - The buffer to write the handshake packet to. It must be exactly [`INIT_MSG_LENGTH`] bytes.
-    ///
-    /// # Returns
-    /// A `Handshake<InitSent>` instance.
-    pub fn initiate(
-        self,
-        sender: u32,
-        ephemeral_secret: StaticSecret,
-        timestamp: Tai64N,
-        cookies: &Generator,
-        buf: &mut [u8],
-    ) -> Handshake<InitSent> {
-        if buf.len() != INIT_MSG_LENGTH {
-            panic!("buf must be at least INIT_MSG_LENGTH bytes");
-        }
-        buf[0] = MessageType::HandshakeInit as u8;
-        buf[1..4].fill(0);
-        buf[INIT_SENDER].copy_from_slice(&sender.to_le_bytes());
-
-        let constr = INITIAL_CONSTR_HASH;
-        let h = hash(&[INITIAL_IDENTIFIER_HASH, self.peer_public.as_ref()]);
-        let ephemeral_public_key = PublicKey::from(&ephemeral_secret);
-        buf[INIT_EPHEMERAL_PK].copy_from_slice(ephemeral_public_key.as_ref());
-
-        let [constr] = kdf::<1>(constr, ephemeral_public_key.as_ref());
-        let h = hash(&[h.as_ref(), ephemeral_public_key.as_ref()]);
-        let shared_secret = ephemeral_secret.diffie_hellman(&self.peer_public);
-        let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
-        let aead = LessSafeKey::new(
-            UnboundKey::new(&CHACHA20_POLY1305, key.as_ref())
-                .map_err(|_| ())
-                .expect("encryption failed"),
-        );
-
-        buf[INIT_ENCRYPTED_STATIC_PK.start..INIT_ENCRYPTED_STATIC_PK.end - AEAD_TAG_SIZE]
-            .copy_from_slice(self.our_public.as_ref());
-
-        aead_seal(&aead, 0, h.as_ref(), &mut buf[INIT_ENCRYPTED_STATIC_PK]);
-        let h = hash(&[h.as_ref(), &buf[INIT_ENCRYPTED_STATIC_PK]]);
-
-        let shared_secret = self.our_private.diffie_hellman(&self.peer_public);
-        let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
-
-        buf[INIT_ENCRYPTED_TIMESTAMP.start..INIT_ENCRYPTED_TIMESTAMP.end - AEAD_TAG_SIZE]
-            .copy_from_slice(&timestamp.to_bytes());
-        let aead = LessSafeKey::new(
-            UnboundKey::new(&CHACHA20_POLY1305, key.as_ref()).expect("encryption failed"),
-        );
-        aead_seal(&aead, 0, h.as_ref(), &mut buf[INIT_ENCRYPTED_TIMESTAMP]);
-
-        let h = hash(&[h.as_ref(), &buf[INIT_ENCRYPTED_TIMESTAMP]]);
-        cookies.add_macs(&timestamp, buf);
-
-        Handshake {
-            our_private: self.our_private,
-            our_public: self.our_public,
-            peer_public: self.peer_public,
-            state: InitSent {
-                constr,
-                h,
-
-                index_initiator: sender,
-                ephemeral_secret_initiator: ephemeral_secret,
-            },
-        }
-    }
-}
-
-impl Handshake<InitReceived> {
     /// Responds to a received handshake initiator message
     ///
     /// # Arguments
@@ -310,6 +228,83 @@ impl Handshake<InitReceived> {
 }
 
 impl Handshake<InitSent> {
+    /// Initiates a handshake with the peer.
+    /// The handshake packet is written to the provided buffer.
+    ///
+    /// # Arguments
+    /// * `sender` - The index of the handshake.
+    /// * `ephemeral_secret` - The ephemeral secret to use for the handshake.
+    /// * `timestamp` - The timestamp to use for the handshake.
+    /// * `cookies` - The cookie generator to use for the handshake.
+    /// * `buf` - The buffer to write the handshake packet to. It must be exactly [`INIT_MSG_LENGTH`] bytes.
+    ///
+    /// # Returns
+    /// A `Handshake<InitSent>` instance.
+    pub fn initiate(
+        our_private: StaticSecret,
+        peer_public: PublicKey,
+        sender: u32,
+        ephemeral_secret: StaticSecret,
+        timestamp: Tai64N,
+        cookies: &Generator,
+        buf: &mut [u8],
+    ) -> Self {
+        if buf.len() != INIT_MSG_LENGTH {
+            panic!("buf must be at least INIT_MSG_LENGTH bytes");
+        }
+        buf[0] = MessageType::HandshakeInit as u8;
+        buf[1..4].fill(0);
+        buf[INIT_SENDER].copy_from_slice(&sender.to_le_bytes());
+
+        let constr = INITIAL_CONSTR_HASH;
+        let h = hash(&[INITIAL_IDENTIFIER_HASH, peer_public.as_ref()]);
+        let ephemeral_public_key = PublicKey::from(&ephemeral_secret);
+        buf[INIT_EPHEMERAL_PK].copy_from_slice(ephemeral_public_key.as_ref());
+
+        let [constr] = kdf::<1>(constr, ephemeral_public_key.as_ref());
+        let h = hash(&[h.as_ref(), ephemeral_public_key.as_ref()]);
+        let shared_secret = ephemeral_secret.diffie_hellman(&peer_public);
+        let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
+        let aead = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, key.as_ref())
+                .map_err(|_| ())
+                .expect("encryption failed"),
+        );
+
+        let our_public = PublicKey::from(&our_private);
+        buf[INIT_ENCRYPTED_STATIC_PK.start..INIT_ENCRYPTED_STATIC_PK.end - AEAD_TAG_SIZE]
+            .copy_from_slice(our_public.as_ref());
+
+        aead_seal(&aead, 0, h.as_ref(), &mut buf[INIT_ENCRYPTED_STATIC_PK]);
+        let h = hash(&[h.as_ref(), &buf[INIT_ENCRYPTED_STATIC_PK]]);
+
+        let shared_secret = our_private.diffie_hellman(&peer_public);
+        let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
+
+        buf[INIT_ENCRYPTED_TIMESTAMP.start..INIT_ENCRYPTED_TIMESTAMP.end - AEAD_TAG_SIZE]
+            .copy_from_slice(&timestamp.to_bytes());
+        let aead = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, key.as_ref()).expect("encryption failed"),
+        );
+        aead_seal(&aead, 0, h.as_ref(), &mut buf[INIT_ENCRYPTED_TIMESTAMP]);
+
+        let h = hash(&[h.as_ref(), &buf[INIT_ENCRYPTED_TIMESTAMP]]);
+        cookies.add_macs(&timestamp, buf);
+
+        Handshake {
+            our_private,
+            our_public,
+            peer_public,
+            state: InitSent {
+                constr,
+                h,
+
+                index_initiator: sender,
+                ephemeral_secret_initiator: ephemeral_secret,
+            },
+        }
+    }
+
     /// Handles a received handshake response message
     ///
     /// # Arguments
@@ -413,14 +408,6 @@ impl Handshake<InitiatorEstablished> {
     }
 }
 
-/// Represents the current state of a handshake.
-pub enum HandshakeState {
-    InitSent(Handshake<InitSent>),
-    InitReceived(Handshake<InitReceived>),
-    ReceiverEstablished(Handshake<ReceiverEstablished>),
-    InitiatorEstablished(Handshake<InitiatorEstablished>),
-}
-
 #[cfg(test)]
 mod test {
     extern crate alloc;
@@ -440,8 +427,6 @@ mod test {
         let sk2 = StaticSecret::random();
         let pk2 = PublicKey::from(&sk2);
 
-        let h_init = Handshake::new(sk1, pk2);
-
         let hs_init = StaticSecret::random();
         let hs_resp = StaticSecret::random();
 
@@ -452,7 +437,9 @@ mod test {
         let cv_resp = Verifier::new(pk1.clone());
 
         let mut init_msg = [0u8; INIT_MSG_LENGTH];
-        let h_init = h_init.initiate(
+        let h_init = Handshake::initiate(
+            sk1,
+            pk2,
             INITIATOR,
             hs_init,
             Tai64N::UNIX_EPOCH,
@@ -463,20 +450,17 @@ mod test {
         assert_eq!(init_msg[0], MessageType::HandshakeInit as u8);
         assert_eq!(init_msg[INIT_SENDER], INITIATOR.to_le_bytes());
 
-        let h_resp = Handshake::new(sk2, pk1);
-
         let mut resp_msg = [0u8; RESP_MSG_LENGTH];
-        let h_resp = h_resp
-            .receive(&mut init_msg)
-            .expect("receive init failed")
-            .respond(
-                RECEIVER,
-                hs_resp,
-                None,
-                Tai64N::UNIX_EPOCH,
-                &cg_resp,
-                &mut resp_msg,
-            );
+        let h_resp = Handshake::receive(sk2, &mut init_msg).expect("receive init failed");
+        assert_eq!(h_resp.peer_key(), pk1);
+        let h_resp = h_resp.respond(
+            RECEIVER,
+            hs_resp,
+            None,
+            Tai64N::UNIX_EPOCH,
+            &cg_resp,
+            &mut resp_msg,
+        );
         assert!(cv_resp.verify_mac_1(&Tai64N::UNIX_EPOCH, &resp_msg)); // TODO: set timestamp
         assert_eq!(resp_msg[0], MessageType::HandshakeResp as u8);
         assert_eq!(

@@ -46,6 +46,10 @@ impl Transport {
         }
     }
 
+    pub fn our_index(&self) -> u32 {
+        self.our_index
+    }
+
     /// Writes an encrypted transport data message to the given buffer.
     pub fn send(&mut self, payload: &[u8], buf: &mut [u8]) {
         if buf.len() != Self::packet_len(payload.len()) {
