@@ -18,8 +18,9 @@ fn complete_handshake() -> (Transport, Transport) {
     let c_resp = Generator::new(pk1);
 
     let mut init_buf = [0u8; INIT_MSG_LENGTH];
-    let h_init = Handshake::new(sk1, pk2);
-    let h_init = h_init.initiate(
+    let h_init = Handshake::initiate(
+        sk1,
+        pk2,
         100,
         StaticSecret::random(),
         Tai64N::UNIX_EPOCH,
@@ -28,9 +29,7 @@ fn complete_handshake() -> (Transport, Transport) {
     );
 
     let mut resp_buf = [0u8; RESP_MSG_LENGTH];
-    let h_resp = Handshake::new(sk2, pk1);
-    let h_resp = h_resp
-        .receive(&mut init_buf)
+    let h_resp = Handshake::receive(sk2, &mut init_buf)
         .expect("invalid init message")
         .respond(
             200,

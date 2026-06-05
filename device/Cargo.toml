@@ -9,9 +9,13 @@ keywords = ["wireguard", "vpn", "tunnel", "networking"]
 
 [dependencies]
 bytes = "1.11.1"
+chrono = "0.4.45"
 etherparse = "0.19.0"
 hex = "0.4.3"
 log = "0.4.29"
 rand = "0.10.0"
 spacetun_protocol = { path = "../protocol", features = ["std"] }
-tokio = { version = "1.49.0", features = ["fs", "net", "rt", "rt-multi-thread", "sync"] }
+tokio = { version = "1.49.0", features = ["fs", "net", "rt", "rt-multi-thread", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["time"] }

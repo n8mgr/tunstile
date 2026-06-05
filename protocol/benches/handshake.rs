@@ -20,14 +20,18 @@ fn bench_handshake(c: &mut Criterion) {
             || (StaticSecret::random(), StaticSecret::random()),
             |(hs_init, hs_resp)| {
                 let mut init_buf = [0u8; INIT_MSG_LENGTH];
-                let h_init = Handshake::new(sk1.clone(), pk2);
-                let h_init =
-                    h_init.initiate(100, hs_init, Tai64N::UNIX_EPOCH, &c_init, &mut init_buf);
+                let h_init = Handshake::initiate(
+                    sk1.clone(),
+                    pk2,
+                    100,
+                    hs_init,
+                    Tai64N::UNIX_EPOCH,
+                    &c_init,
+                    &mut init_buf,
+                );
 
                 let mut resp_buf = [0u8; RESP_MSG_LENGTH];
-                let h_resp = Handshake::new(sk2.clone(), pk1);
-                let h_resp = h_resp
-                    .receive(&mut init_buf)
+                let h_resp = Handshake::receive(sk2.clone(), &mut init_buf)
                     .expect("receive failed")
                     .respond(
                         200,
