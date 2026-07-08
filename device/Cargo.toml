@@ -13,9 +13,16 @@ chrono = "0.4.45"
 etherparse = "0.19.0"
 hex = "0.4.3"
 log = "0.4.29"
+quinn-udp = { version = "0.6.1", features = ["fast-apple-datapath"] }
 rand = "0.10.0"
 spacetun_protocol = { path = "../protocol", features = ["std"] }
-tokio = { version = "1.49.0", features = ["fs", "net", "rt", "rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1.49.0", features = ["fs", "net", "rt", "rt-multi-thread", "sync", "macros", "io-util"] }
 
 [dev-dependencies]
 tokio = { version = "1.49.0", features = ["time"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+env_logger = "0.11.10"
+
+[[bench]]
+name = "tunnel"
+harness = false

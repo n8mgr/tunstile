@@ -479,8 +479,8 @@ mod test {
             .expect("valid response");
         assert_eq!(h_init.state.constr, h_resp.state.constr);
 
-        let mut t_init = h_init.finish();
-        let mut t_resp = h_resp.finish();
+        let t_init = h_init.finish();
+        let t_resp = h_resp.finish();
 
         const INITIATOR_DATA: &[u8] = b"Hello, World!";
 

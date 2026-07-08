@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io,
+    io::{self, IoSliceMut},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, RwLock},
 };
@@ -8,6 +8,7 @@ use std::{
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use log::debug;
+use quinn_udp::{BATCH_SIZE, RecvMeta};
 use spacetun_protocol::{
     MessageHeader,
     cookies::{Generator, Verifier},
@@ -19,33 +20,38 @@ pub use spacetun_protocol::{
     transport::Transport,
 };
 use tokio::{
-    net::UdpSocket,
     spawn,
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
 };
 
+mod pool;
+mod socket;
+use pool::{BufferPool, RefGuard};
+use socket::UdpSocket;
+
 const MAX_MESSAGE_SIZE: usize = 65535;
+const BUFFER_POOL_SIZE: usize = 256;
 
 enum PeerAction {
     SendHandshake,
     SendData(Vec<u8>),
-    RecvData(Vec<u8>, SocketAddr),
+    RecvData(RefGuard, SocketAddr),
     RecvHandshakeInit(Handshake<InitReceived>, SocketAddr),
-    RecvHandshakeResp(Vec<u8>, SocketAddr),
+    RecvHandshakeResp(RefGuard, SocketAddr),
 }
 
 #[derive(Clone, Debug)]
 pub struct PeerStatus {
-    public_key: PublicKey,
-    endpoint: Option<SocketAddr>,
+    pub public_key: PublicKey,
+    pub endpoint: Option<SocketAddr>,
 
-    tx_bytes: u64,
-    rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
 
-    last_send: Option<DateTime<Utc>>,
-    last_recv: Option<DateTime<Utc>>,
-    last_successful_handshake: Option<DateTime<Utc>>,
+    pub last_send: Option<DateTime<Utc>>,
+    pub last_recv: Option<DateTime<Utc>>,
+    pub last_successful_handshake: Option<DateTime<Utc>>,
 }
 
 struct PeerActor {
@@ -58,9 +64,10 @@ struct PeerActor {
     cookie_verifier: Verifier,
 
     handshake: Option<Handshake<InitSent>>,
-    transport: Option<Transport>,
+    transport: Option<Arc<Transport>>,
 
     socket: Arc<UdpSocket>,
+    pool: Arc<BufferPool>,
 
     status: Arc<RwLock<PeerStatus>>,
 
@@ -69,7 +76,7 @@ struct PeerActor {
 }
 
 impl PeerActor {
-    fn rotate_transport(&mut self, new_transport: Transport) {
+    fn rotate_transport(&mut self, new_transport: Arc<Transport>) {
         if let Some(old_transport) = self.transport.replace(new_transport) {
             self.router.retire_index(old_transport.our_index());
         }
@@ -100,7 +107,7 @@ impl PeerActor {
                     &mut msg,
                 );
                 self.handshake = Some(handshake);
-                if let Err(e) = self.socket.send_to(&msg, self.endpoint).await {
+                if let Err(e) = self.socket.send(self.endpoint, &msg).await {
                     debug!("Failed to send handshake response: {:?}", e);
                     return;
                 }
@@ -111,35 +118,24 @@ impl PeerActor {
                 self.router.bind_index(&self.peer_key, our_index);
             }
             PeerAction::SendData(payload) => {
-                if let Some(transport) = &mut self.transport {
-                    let mut msg = BytesMut::zeroed(Transport::packet_len(payload.len()));
-                    transport.send(&payload, &mut msg);
-                    let _ = self
-                        .socket
-                        .send_to(&msg, self.endpoint)
-                        .await
-                        .inspect(|n| {
-                            self.update_status(|status| {
-                                status.tx_bytes += *n as u64;
-                                status.last_send = Some(Utc::now());
-                            });
-                        })
-                        .inspect_err(|e| {
-                            debug!("Failed to send outbound packet: {:?}", e);
-                        });
-                }
+                let mut payloads = vec![payload];
+                self.flush_sends(&mut payloads).await;
             }
             PeerAction::RecvData(mut data, endpoint) => {
-                let rx_bytes = data.len() as u64;
-                if let Some(transport) = &mut self.transport {
-                    let data = transport.receive(&mut data).unwrap(); // TODO: handle error
-                    self.endpoint = endpoint;
-                    let _ = self.data_tx.send(data.to_vec()).await;
-                    self.update_status(|status| {
-                        status.endpoint = Some(endpoint);
-                        status.rx_bytes += rx_bytes;
-                        status.last_recv = Some(Utc::now());
-                    });
+                if let Some(transport) = self.transport.clone() {
+                    let rx_bytes = data.len() as u64;
+                    match transport.receive(&mut data) {
+                        Ok(payload) => {
+                            let _ = self.data_tx.send(payload.to_vec()).await;
+                            self.endpoint = endpoint;
+                            self.update_status(|status| {
+                                status.endpoint = Some(endpoint);
+                                status.rx_bytes += rx_bytes;
+                                status.last_recv = Some(Utc::now());
+                            });
+                        }
+                        Err(e) => debug!("Failed to decrypt inbound packet: {:?}", e),
+                    }
                 }
             }
             PeerAction::RecvHandshakeInit(handshake, endpoint) => {
@@ -157,12 +153,12 @@ impl PeerActor {
                         &mut msg,
                     )
                     .finish();
-                if let Err(e) = self.socket.send_to(&msg, endpoint).await {
+                if let Err(e) = self.socket.send(endpoint, &msg).await {
                     debug!("Failed to send handshake response: {:?}", e);
                     return;
                 }
                 self.router.bind_index(&self.peer_key, our_index);
-                self.rotate_transport(new_transport);
+                self.rotate_transport(Arc::new(new_transport));
                 self.endpoint = endpoint;
                 self.update_status(|status| {
                     status.endpoint = Some(endpoint);
@@ -180,7 +176,7 @@ impl PeerActor {
                     .response_received(None, &mut resp)
                     .unwrap() // TODO: handle error
                     .finish();
-                self.rotate_transport(new_transport);
+                self.rotate_transport(Arc::new(new_transport));
                 self.endpoint = endpoint;
                 self.update_status(|status| {
                     status.endpoint = Some(endpoint);
@@ -192,9 +188,62 @@ impl PeerActor {
         }
     }
 
+    async fn flush_sends(&mut self, payloads: &mut Vec<Vec<u8>>) {
+        let Some(transport) = self.transport.clone() else {
+            payloads.clear();
+            return;
+        };
+        let max_segments = self.socket.max_gso_segments();
+        let mut start = 0;
+        while start < payloads.len() {
+            let segment_size = Transport::packet_len(payloads[start].len());
+            let mut end = start + 1;
+            while end < payloads.len()
+                && end - start < max_segments
+                && Transport::packet_len(payloads[end].len()) == segment_size
+            {
+                end += 1;
+            }
+            let mut batch = self.pool.clone().pop();
+            batch.resize((end - start) * segment_size, 0);
+            for (payload, buf) in payloads[start..end]
+                .iter()
+                .zip(batch.chunks_mut(segment_size))
+            {
+                transport.send(payload, buf);
+            }
+            match self
+                .socket
+                .send_segments(self.endpoint, &batch, segment_size)
+                .await
+            {
+                Ok(()) => {
+                    self.update_status(|status| {
+                        status.tx_bytes += batch.len() as u64;
+                        status.last_send = Some(Utc::now());
+                    });
+                }
+                Err(e) => debug!("Failed to send outbound packets: {:?}", e),
+            }
+            start = end;
+        }
+        payloads.clear();
+    }
+
     pub async fn run(mut self, mut rx: Receiver<PeerAction>) {
-        while let Some(msg) = rx.recv().await {
-            self.handle_message(msg).await
+        let mut actions = Vec::with_capacity(BATCH_SIZE);
+        let mut payloads = Vec::with_capacity(BATCH_SIZE);
+        while rx.recv_many(&mut actions, BATCH_SIZE).await != 0 {
+            for action in actions.drain(..) {
+                match action {
+                    PeerAction::SendData(payload) => payloads.push(payload),
+                    action => {
+                        self.flush_sends(&mut payloads).await;
+                        self.handle_message(action).await;
+                    }
+                }
+            }
+            self.flush_sends(&mut payloads).await;
         }
     }
 }
@@ -281,7 +330,7 @@ impl RoutingTable {
         &self,
         endpoint: SocketAddr,
         peer_index: u32,
-        packet: Vec<u8>,
+        packet: RefGuard,
     ) -> bool {
         if let Some(sender) = self.peer_index_sender(peer_index) {
             let _ = sender
@@ -292,7 +341,7 @@ impl RoutingTable {
         false
     }
 
-    async fn recv_data(&self, endpoint: SocketAddr, peer_index: u32, packet: Vec<u8>) -> bool {
+    async fn recv_data(&self, endpoint: SocketAddr, peer_index: u32, packet: RefGuard) -> bool {
         if let Some(sender) = self.peer_index_sender(peer_index) {
             let _ = sender.send(PeerAction::RecvData(packet, endpoint)).await;
             return true;
@@ -305,6 +354,7 @@ pub struct Tunnel {
     our_key: StaticSecret,
     socket: Arc<UdpSocket>,
     router: Arc<RoutingTable>,
+    pool: Arc<BufferPool>,
     peer_status: RwLock<HashMap<PublicKey, Arc<RwLock<PeerStatus>>>>,
     read_task: JoinHandle<()>,
 
@@ -323,27 +373,68 @@ impl Tunnel {
         our_private: StaticSecret,
         socket: Arc<UdpSocket>,
         router: Arc<RoutingTable>,
+        pool: Arc<BufferPool>,
     ) {
+        let mut bufs = vec![vec![0u8; MAX_MESSAGE_SIZE]; BATCH_SIZE];
+        let mut metas = [RecvMeta::default(); BATCH_SIZE];
         loop {
-            let mut message = vec![0u8; MAX_MESSAGE_SIZE];
-            let (n, src) = socket.recv_from(&mut message).await.unwrap(); // TODO: handle error
-            message.truncate(n);
-            let header = MessageHeader::try_from(message.as_ref()).unwrap(); // TODO: handle error
-            match header {
-                MessageHeader::HandshakeInit => {
-                    let handshake = Handshake::receive(our_private.clone(), &mut message).unwrap(); // TODO: handle error
-                    let _ = router.recv_handshake_init(src, handshake).await;
-                }
-                MessageHeader::HandshakeResponse { receiver } => {
-                    let _ = router.recv_handshake_resp(src, receiver, message).await;
-                }
-                MessageHeader::Data { receiver } => {
-                    let _ = router.recv_data(src, receiver, message).await;
-                }
-                MessageHeader::CookieReply { receiver: _ } => {
-                    unimplemented!()
+            let mut slices: Vec<IoSliceMut> = bufs.iter_mut().map(|b| IoSliceMut::new(b)).collect();
+            let n = match socket.recv(&mut slices, &mut metas).await {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!("Failed to receive packets: {:?}", e);
+                    continue;
                 }
             };
+            drop(slices);
+            for (buf, meta) in bufs.iter_mut().zip(metas.iter()).take(n) {
+                let mut offset = 0;
+                while offset < meta.len {
+                    let len = meta.stride.min(meta.len - offset);
+                    if len == 0 {
+                        break;
+                    }
+                    let segment = &mut buf[offset..offset + len];
+                    offset += len;
+                    let header = match MessageHeader::try_from(&*segment) {
+                        Ok(header) => header,
+                        Err(e) => {
+                            debug!("Dropping invalid packet from {}: {:?}", meta.addr, e);
+                            continue;
+                        }
+                    };
+                    match header {
+                        MessageHeader::HandshakeInit => {
+                            match Handshake::receive(our_private.clone(), segment) {
+                                Ok(handshake) => {
+                                    let _ = router.recv_handshake_init(meta.addr, handshake).await;
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        "Dropping invalid handshake init from {}: {:?}",
+                                        meta.addr, e
+                                    );
+                                }
+                            }
+                        }
+                        MessageHeader::HandshakeResponse { receiver } => {
+                            let mut packet = pool.clone().pop();
+                            packet.extend_from_slice(segment);
+                            let _ = router
+                                .recv_handshake_resp(meta.addr, receiver, packet)
+                                .await;
+                        }
+                        MessageHeader::Data { receiver } => {
+                            let mut packet = pool.clone().pop();
+                            packet.extend_from_slice(segment);
+                            let _ = router.recv_data(meta.addr, receiver, packet).await;
+                        }
+                        MessageHeader::CookieReply { receiver: _ } => {
+                            unimplemented!()
+                        }
+                    };
+                }
+            }
         }
     }
 
@@ -365,6 +456,7 @@ impl Tunnel {
                     endpoint,
                     router: self.router.clone(),
                     socket: self.socket.clone(),
+                    pool: self.pool.clone(),
                     cookie_generator: Generator::new(peer_key),
                     cookie_verifier: Verifier::new(peer_key),
                     status: status.clone(),
@@ -422,17 +514,20 @@ impl Tunnel {
     ) -> io::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         let router = Arc::new(RoutingTable::new());
+        let pool = Arc::new(BufferPool::new(BUFFER_POOL_SIZE));
         let (data_tx, data_rx) = mpsc::channel(64);
         let read_task = spawn(Self::read_loop(
             our_key.clone(),
             socket.clone(),
             router.clone(),
+            pool.clone(),
         ));
         Ok((
             Self {
                 our_key,
                 socket,
                 router,
+                pool,
                 read_task,
                 data_tx,
 
@@ -454,8 +549,6 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
     }
 
-    // resends to absorb the handshake-completion race, then asserts the payload
-    // arrives decrypted on `rx`.
     fn assert_peer_ready(from: &Tunnel, peer: &PublicKey) {
         for _ in 0..40 {
             if let Some(ps) = from.peer(peer)

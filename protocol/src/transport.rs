@@ -1,4 +1,7 @@
-use core::ops::Range;
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use ring::aead::LessSafeKey;
 use thiserror::Error;
 
@@ -25,7 +28,7 @@ pub struct Transport {
     recv_aead: LessSafeKey,
     // TODO: replay protection
     send_aead: LessSafeKey,
-    send_counter: u64,
+    send_counter: AtomicU64,
 }
 
 impl Transport {
@@ -42,7 +45,7 @@ impl Transport {
             recv_aead,
 
             send_aead,
-            send_counter: 0,
+            send_counter: AtomicU64::new(0),
         }
     }
 
@@ -51,23 +54,22 @@ impl Transport {
     }
 
     /// Writes an encrypted transport data message to the given buffer.
-    pub fn send(&mut self, payload: &[u8], buf: &mut [u8]) {
+    pub fn send(&self, payload: &[u8], buf: &mut [u8]) {
         if buf.len() != Self::packet_len(payload.len()) {
             panic!("buffer size mismatch");
         }
+        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
         buf[0] = MessageType::Data as u8;
         buf[1..4].fill(0);
         buf[DATA_RECEIVER].copy_from_slice(&self.peer_index.to_le_bytes());
-        buf[DATA_COUNTER].copy_from_slice(&self.send_counter.to_le_bytes());
+        buf[DATA_COUNTER].copy_from_slice(&counter.to_le_bytes());
         buf[DATA_PAYLOAD_OFFSET..DATA_PAYLOAD_OFFSET + payload.len()].copy_from_slice(payload);
         aead_seal(
             &self.send_aead,
-            self.send_counter,
+            counter,
             &[],
             &mut buf[DATA_PAYLOAD_OFFSET..],
         );
-
-        self.send_counter += 1;
     }
 
     pub const fn packet_len(payload_size: usize) -> usize {
@@ -75,7 +77,7 @@ impl Transport {
     }
 
     /// Decrypts a received encrypted transport data message
-    pub fn receive<'a>(&mut self, packet: &'a mut [u8]) -> Result<&'a [u8], TransportError> {
+    pub fn receive<'a>(&self, packet: &'a mut [u8]) -> Result<&'a [u8], TransportError> {
         if packet.len() < Self::packet_len(0)
             || MessageType::try_from(packet[0]) != Ok(MessageType::Data)
         {
