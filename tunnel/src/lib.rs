@@ -9,6 +9,7 @@ use std::{
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
+pub use bytes::Bytes;
 use bytes::BytesMut;
 use log::debug;
 use quinn_udp::{BATCH_SIZE, RecvMeta};
@@ -117,7 +118,7 @@ impl PeerConfig {
 
 enum PeerAction {
     Connect(SocketAddr),
-    SendData(Vec<u8>),
+    SendData(Bytes),
     RecvData(RefGuard, SocketAddr),
     RecvHandshakeInit(Handshake<InitReceived>, SocketAddr),
     RecvHandshakeResp(RefGuard, SocketAddr),
@@ -174,14 +175,14 @@ struct PeerActor {
     pending_handshake: Option<PendingHandshake>,
     session: Option<Session>,
     session_tx: watch::Sender<bool>,
-    staged: VecDeque<Vec<u8>>,
+    staged: VecDeque<Bytes>,
 
     socket: Arc<UdpSocket>,
     pool: Arc<BufferPool>,
 
     status: Arc<RwLock<PeerStatus>>,
 
-    data_tx: Sender<Vec<u8>>,
+    data_tx: Sender<Bytes>,
 }
 
 impl PeerActor {
@@ -232,7 +233,8 @@ impl PeerActor {
                 let rx_bytes = data.len() as u64;
                 match transport.receive(&mut data) {
                     Ok(payload) => {
-                        let payload = (!payload.is_empty()).then(|| payload.to_vec());
+                        let payload =
+                            (!payload.is_empty()).then(|| Bytes::copy_from_slice(payload));
                         let session = self.session.as_mut().unwrap();
                         session.unanswered_send = None;
                         if payload.is_some() && session.keepalive_at.is_none() {
@@ -363,7 +365,7 @@ impl PeerActor {
         }
     }
 
-    fn stage(&mut self, payloads: &mut Vec<Vec<u8>>) {
+    fn stage(&mut self, payloads: &mut Vec<Bytes>) {
         for payload in payloads.drain(..) {
             if self.staged.len() == MAX_STAGED_PACKETS {
                 self.staged.pop_front();
@@ -376,11 +378,11 @@ impl PeerActor {
         if self.staged.is_empty() {
             return;
         }
-        let mut payloads: Vec<Vec<u8>> = self.staged.drain(..).collect();
+        let mut payloads: Vec<Bytes> = self.staged.drain(..).collect();
         self.flush_sends(&mut payloads).await;
     }
 
-    async fn flush_sends(&mut self, payloads: &mut Vec<Vec<u8>>) {
+    async fn flush_sends(&mut self, payloads: &mut Vec<Bytes>) {
         if payloads.is_empty() {
             return;
         }
@@ -682,7 +684,7 @@ impl RoutingTable {
             .map_err(|_| SendError::Closed)
     }
 
-    async fn send_data(&self, public_key: &PublicKey, packet: Vec<u8>) -> Result<(), SendError> {
+    async fn send_data(&self, public_key: &PublicKey, packet: Bytes) -> Result<(), SendError> {
         let sender = self.peer_key_sender(public_key).ok_or(SendError::Closed)?;
         sender
             .send(PeerAction::SendData(packet))
@@ -738,7 +740,7 @@ pub struct Peer {
     router: Weak<RoutingTable>,
     status: Arc<RwLock<PeerStatus>>,
     session_rx: watch::Receiver<bool>,
-    data_rx: mpsc::Receiver<Vec<u8>>,
+    data_rx: mpsc::Receiver<Bytes>,
 }
 
 impl Drop for Peer {
@@ -760,13 +762,13 @@ impl Peer {
 
     /// Receives the next decrypted payload from this peer. Returns `None`
     /// once the peer is removed or the tunnel is dropped.
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+    pub async fn recv(&mut self) -> Option<Bytes> {
         self.data_rx.recv().await
     }
 
-    pub async fn send(&self, payload: Vec<u8>) -> Result<(), SendError> {
+    pub async fn send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
         let router = self.router.upgrade().ok_or(SendError::Closed)?;
-        router.send_data(&self.public_key, payload).await
+        router.send_data(&self.public_key, payload.into()).await
     }
 
     /// Updates the peer's endpoint and initiates a handshake if none is in
@@ -790,7 +792,7 @@ impl Peer {
 }
 
 impl futures_core::Stream for Peer {
-    type Item = Vec<u8>;
+    type Item = Bytes;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.get_mut().data_rx.poll_recv(cx)

@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use spacetun_tunnel::{Peer, PublicKey, StaticSecret, Tunnel};
+use spacetun_tunnel::{Bytes, Peer, PublicKey, StaticSecret, Tunnel};
 use tokio::{runtime::Runtime, sync::Mutex};
 
 const PAYLOAD_LEN: usize = 1420;
@@ -43,7 +43,7 @@ fn setup(rt: &Runtime) -> Established {
 fn bench_roundtrip(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let (_tunnel_a, _tunnel_b, peer_b, peer_a) = setup(&rt);
-    let payload = vec![0xABu8; PAYLOAD_LEN];
+    let payload = Bytes::from(vec![0xABu8; PAYLOAD_LEN]);
 
     let mut group = c.benchmark_group("tunnel");
     group.throughput(Throughput::Bits(PAYLOAD_LEN as u64 * 8));
@@ -66,7 +66,7 @@ fn bench_roundtrip(c: &mut Criterion) {
 fn bench_pipelined(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let (_tunnel_a, _tunnel_b, peer_b, peer_a) = setup(&rt);
-    let payload = vec![0xABu8; PAYLOAD_LEN];
+    let payload = Bytes::from(vec![0xABu8; PAYLOAD_LEN]);
 
     let mut group = c.benchmark_group("tunnel");
     group.throughput(Throughput::Bits((BATCH * PAYLOAD_LEN) as u64 * 8));
