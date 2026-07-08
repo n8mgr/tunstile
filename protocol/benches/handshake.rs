@@ -4,7 +4,7 @@ use spacetun_protocol::{
     handshake::{Handshake, INIT_MSG_LENGTH, RESP_MSG_LENGTH},
 };
 use tai64::Tai64N;
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey, ReusableSecret, StaticSecret};
 
 fn bench_handshake(c: &mut Criterion) {
     let sk1 = StaticSecret::random();
@@ -17,7 +17,7 @@ fn bench_handshake(c: &mut Criterion) {
 
     c.bench_function("handshake_e2e", |b| {
         b.iter_batched(
-            || (StaticSecret::random(), StaticSecret::random()),
+            || (ReusableSecret::random(), ReusableSecret::random()),
             |(hs_init, hs_resp)| {
                 let mut init_buf = [0u8; INIT_MSG_LENGTH];
                 let h_init = Handshake::initiate(

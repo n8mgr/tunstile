@@ -3,7 +3,7 @@ use core::ops::Range;
 use ring::aead::{CHACHA20_POLY1305, LessSafeKey, UnboundKey};
 use tai64::Tai64N;
 use thiserror::Error;
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey, ReusableSecret, StaticSecret};
 use zeroize::ZeroizeOnDrop;
 
 use crate::{
@@ -68,7 +68,7 @@ pub struct Handshake<S> {
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct InitSent {
     index_initiator: u32,
-    ephemeral_secret_initiator: StaticSecret,
+    ephemeral_secret_initiator: ReusableSecret,
 
     constr: Hash256,
     h: Hash256,
@@ -178,7 +178,7 @@ impl Handshake<InitReceived> {
     pub fn respond(
         self,
         index: u32,
-        ephemeral_secret: StaticSecret,
+        ephemeral_secret: ReusableSecret,
         preshared_key: Option<[u8; 32]>,
         timestamp: Tai64N,
         cookies: &Generator,
@@ -245,7 +245,7 @@ impl Handshake<InitSent> {
         our_private: StaticSecret,
         peer_public: PublicKey,
         sender: u32,
-        ephemeral_secret: StaticSecret,
+        ephemeral_secret: ReusableSecret,
         timestamp: Tai64N,
         cookies: &Generator,
         buf: &mut [u8],
@@ -428,8 +428,8 @@ mod test {
         let sk2 = StaticSecret::random();
         let pk2 = PublicKey::from(&sk2);
 
-        let hs_init = StaticSecret::random();
-        let hs_resp = StaticSecret::random();
+        let hs_init = ReusableSecret::random();
+        let hs_resp = ReusableSecret::random();
 
         // macs are computed using the other party's public key
         let cg_init = Generator::new(pk2.clone());

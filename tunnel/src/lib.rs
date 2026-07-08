@@ -13,7 +13,7 @@ use bytes::BytesMut;
 use log::debug;
 use quinn_udp::{BATCH_SIZE, RecvMeta};
 use spacetun_protocol::{
-    MessageHeader, Tai64N,
+    MessageHeader, ReusableSecret, Tai64N,
     cookies::{Generator, Verifier},
     handshake::{self, Handshake, INIT_MSG_LENGTH, InitReceived, InitSent},
     transport::Transport,
@@ -259,7 +259,7 @@ impl PeerActor {
             }
             PeerAction::RecvHandshakeInit(handshake, endpoint) => {
                 let mut msg = BytesMut::zeroed(handshake::RESP_MSG_LENGTH);
-                let ephemeral_secret = StaticSecret::random();
+                let ephemeral_secret = ReusableSecret::random();
                 let timestamp = Tai64N::now();
                 let our_index = rand::random();
                 let new_transport = handshake
@@ -326,7 +326,7 @@ impl PeerActor {
             return;
         };
         let our_index = rand::random();
-        let ephemeral_secret = StaticSecret::random();
+        let ephemeral_secret = ReusableSecret::random();
         let timestamp = Tai64N::now();
         let mut msg = vec![0u8; handshake::INIT_MSG_LENGTH];
         let state = Handshake::initiate(

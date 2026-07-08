@@ -6,7 +6,7 @@ use spacetun_protocol::{
     transport::Transport,
 };
 use tai64::Tai64N;
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey, ReusableSecret, StaticSecret};
 
 fn complete_handshake() -> (Transport, Transport) {
     let sk1 = StaticSecret::random();
@@ -22,7 +22,7 @@ fn complete_handshake() -> (Transport, Transport) {
         sk1,
         pk2,
         100,
-        StaticSecret::random(),
+        ReusableSecret::random(),
         Tai64N::UNIX_EPOCH,
         &c_init,
         &mut init_buf,
@@ -33,7 +33,7 @@ fn complete_handshake() -> (Transport, Transport) {
         .expect("invalid init message")
         .respond(
             200,
-            StaticSecret::random(),
+            ReusableSecret::random(),
             None,
             Tai64N::UNIX_EPOCH,
             &c_resp,

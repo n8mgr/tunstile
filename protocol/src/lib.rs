@@ -86,4 +86,4 @@ pub mod handshake;
 
 pub use tai64::*;
 use thiserror::Error;
-pub use x25519_dalek::{PublicKey, StaticSecret};
+pub use x25519_dalek::{PublicKey, ReusableSecret, StaticSecret};

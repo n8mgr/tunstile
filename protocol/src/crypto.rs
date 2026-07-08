@@ -6,7 +6,7 @@ use core::{
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::{
     XChaCha20Poly1305,
-    aead::{self, AeadMutInPlace},
+    aead::{self, AeadInOut},
 };
 use hmac::{Mac, SimpleHmac};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
@@ -116,29 +116,31 @@ pub(crate) fn aead_open<'a>(
 /// authentication tag.
 #[allow(unused)] // TODO: implement cookies
 pub(crate) fn xaead_seal(
-    cipher: &mut XChaCha20Poly1305,
+    cipher: &XChaCha20Poly1305,
     nonce: [u8; 24],
     auth_text: &[u8],
     data: &mut [u8],
 ) {
     let plaintext_len = data.len() - 16;
+    let (buf, tag_buf) = data.split_at_mut(plaintext_len);
     let tag = cipher
-        .encrypt_in_place_detached(&nonce.into(), auth_text, &mut data[..plaintext_len])
+        .encrypt_inout_detached(&nonce.into(), auth_text, buf.into())
         .unwrap();
-    data[plaintext_len..].copy_from_slice(&tag);
+    tag_buf.copy_from_slice(&tag);
 }
 
 /// Decrypts data using XChaCha20Poly1305 with a given nonce and authentication text
 /// The cipher text is decrypted in place.
 #[allow(unused)] // TODO: implement cookies
 pub(crate) fn xaead_open(
-    cipher: &mut XChaCha20Poly1305,
+    cipher: &XChaCha20Poly1305,
     nonce: [u8; 24],
     auth_text: &[u8],
     cipher_text: &mut [u8],
     tag: &[u8],
 ) -> Result<(), aead::Error> {
-    cipher.decrypt_in_place_detached(&nonce.into(), auth_text, cipher_text, tag.into())
+    let tag = tag.try_into().map_err(|_| aead::Error)?;
+    cipher.decrypt_inout_detached(&nonce.into(), auth_text, cipher_text.into(), tag)
 }
 
 /// Computes a 16 byte MAC using the Blake2s256 in keyed mode.

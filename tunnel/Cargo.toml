@@ -9,20 +9,20 @@ keywords = ["wireguard", "vpn", "tunnel", "networking"]
 
 [dependencies]
 base64 = "0.22.1"
-bytes = "1.11.1"
-etherparse = "0.19.0"
-futures-core = "0.3.31"
+bytes = "1.12.1"
+etherparse = "0.20.3"
+futures-core = "0.3.32"
 hex = "0.4.3"
-log = "0.4.29"
+log = "0.4.33"
 quinn-udp = { version = "0.6.1", features = ["fast-apple-datapath"] }
-rand = "0.10.0"
+rand = "0.10.2"
 spacetun_protocol = { path = "../protocol", features = ["std"] }
 thiserror = "2.0.18"
-tokio = { version = "1.49.0", features = ["fs", "net", "rt", "rt-multi-thread", "sync", "macros", "io-util", "time"] }
+tokio = { version = "1.52.3", features = ["fs", "net", "rt", "rt-multi-thread", "sync", "macros", "io-util", "time"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
-env_logger = "0.11.10"
+env_logger = "0.11.11"
 
 [[bench]]
 name = "tunnel"
