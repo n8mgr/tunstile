@@ -55,6 +55,7 @@ pub enum HandshakeError {
     Failed,
 }
 
+#[derive(Clone)]
 pub struct Handshake<S> {
     our_private: StaticSecret,
     our_public: PublicKey,
@@ -64,7 +65,7 @@ pub struct Handshake<S> {
 }
 
 // initiator state
-#[derive(ZeroizeOnDrop)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct InitSent {
     index_initiator: u32,
     ephemeral_secret_initiator: StaticSecret,

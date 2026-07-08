@@ -17,7 +17,7 @@ use crate::AEAD_TAG_SIZE;
 
 type HMACBlake2s256 = SimpleHmac<Blake2s256>;
 
-#[derive(ZeroizeOnDrop, Default, Debug, PartialEq)]
+#[derive(Clone, ZeroizeOnDrop, Default, Debug, PartialEq)]
 pub(crate) struct Hash256([u8; 32]);
 
 impl From<[u8; 32]> for Hash256 {

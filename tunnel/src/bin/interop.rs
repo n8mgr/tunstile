@@ -1,5 +1,5 @@
 use etherparse::PacketBuilder;
-use spacetun_device::{PublicKey, StaticSecret, Tunnel};
+use spacetun_tunnel::{PublicKey, StaticSecret, Tunnel};
 use std::{net::SocketAddr, thread::sleep, time::Duration};
 
 #[tokio::main]
@@ -27,8 +27,8 @@ async fn main() {
     let bind: SocketAddr = "127.0.0.1:51820".parse().unwrap();
     let go_addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
 
-    let (tunnel, _rx) = Tunnel::new(bind, our_private).await.unwrap();
-    tunnel.connect_peer(go_public, go_addr).await;
+    let tunnel = Tunnel::new(bind, our_private).await.unwrap();
+    let peer = tunnel.connect_peer(go_public, go_addr).await.unwrap();
     println!("sent handshake init; waiting for handshake to complete");
 
     sleep(Duration::from_millis(500));
@@ -36,7 +36,7 @@ async fn main() {
     let builder = PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(12345, 12345);
     let mut ip_pkt = Vec::new();
     builder.write(&mut ip_pkt, b"hello from rust").unwrap();
-    tunnel.send(go_public, ip_pkt).await;
+    peer.send(ip_pkt).await.unwrap();
     println!("sent transport packet");
 
     sleep(Duration::from_millis(500));

@@ -1,3 +1,3 @@
 [workspace]
-members = ["device", "protocol"]
+members = ["protocol", "tunnel"]
 resolver = "2"

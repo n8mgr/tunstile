@@ -1,8 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, thread::sleep, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use spacetun_device::{PublicKey, StaticSecret, Tunnel};
-use tokio::{runtime::Runtime, sync::Mutex, sync::mpsc::Receiver};
+use spacetun_tunnel::{Peer, PublicKey, StaticSecret, Tunnel};
+use tokio::{runtime::Runtime, sync::Mutex};
 
 const PAYLOAD_LEN: usize = 1420;
 const BATCH: usize = 256;
@@ -11,12 +11,8 @@ fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
 
-type Established = (
-    Arc<Tunnel>,
-    Tunnel,
-    Arc<Mutex<Receiver<Vec<u8>>>>,
-    PublicKey,
-);
+// the tunnels are returned so the caller keeps their read loops alive
+type Established = (Tunnel, Tunnel, Arc<Peer>, Arc<Mutex<Peer>>);
 
 fn setup(rt: &Runtime) -> Established {
     let _ = env_logger::try_init();
@@ -26,72 +22,67 @@ fn setup(rt: &Runtime) -> Established {
         let sk_b = StaticSecret::random();
         let pk_b = PublicKey::from(&sk_b);
 
-        let (tunnel_a, _rx_a) = Tunnel::new(loopback(), sk_a).await.unwrap();
-        let (tunnel_b, rx_b) = Tunnel::new(loopback(), sk_b).await.unwrap();
+        let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
+        let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
 
-        tunnel_b.allow_peer(pk_a);
-        tunnel_a.connect_peer(pk_b, addr_b).await;
-
-        loop {
-            if let Some(ps) = tunnel_a.peer(&pk_b)
-                && ps.last_successful_handshake.is_some()
-            {
-                break;
-            }
-            sleep(Duration::from_millis(50));
-        }
+        let peer_a = tunnel_b.allow_peer(pk_a).unwrap();
+        let peer_b = tunnel_a.connect_peer(pk_b, addr_b).await.unwrap();
+        peer_b.ready().await.unwrap();
 
         (
-            Arc::new(tunnel_a),
+            tunnel_a,
             tunnel_b,
-            Arc::new(Mutex::new(rx_b)),
-            pk_b,
+            Arc::new(peer_b),
+            Arc::new(Mutex::new(peer_a)),
         )
     })
 }
 
+// Latency-bound: reports per-packet round-trip cost, not throughput.
 fn bench_roundtrip(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let (tunnel_a, _tunnel_b, rx_b, pk_b) = setup(&rt);
+    let (_tunnel_a, _tunnel_b, peer_b, peer_a) = setup(&rt);
     let payload = vec![0xABu8; PAYLOAD_LEN];
 
     let mut group = c.benchmark_group("tunnel");
     group.throughput(Throughput::Bits(PAYLOAD_LEN as u64 * 8));
     group.bench_function("datapath_roundtrip", |b| {
         b.to_async(&rt).iter(|| {
-            let tunnel_a = tunnel_a.clone();
-            let rx_b = rx_b.clone();
+            let peer_b = peer_b.clone();
+            let peer_a = peer_a.clone();
             let payload = payload.clone();
             async move {
-                tunnel_a.send(pk_b, payload).await;
-                rx_b.lock().await.recv().await.unwrap();
+                peer_b.send(payload).await.unwrap();
+                peer_a.lock().await.recv().await.unwrap();
             }
         });
     });
     group.finish();
 }
 
+// Bounded mailboxes backpressure the send side and the inbound queue is
+// deeper than BATCH, keeping this lossless; reports saturated throughput.
 fn bench_pipelined(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let (tunnel_a, _tunnel_b, rx_b, pk_b) = setup(&rt);
+    let (_tunnel_a, _tunnel_b, peer_b, peer_a) = setup(&rt);
     let payload = vec![0xABu8; PAYLOAD_LEN];
 
     let mut group = c.benchmark_group("tunnel");
     group.throughput(Throughput::Bits((BATCH * PAYLOAD_LEN) as u64 * 8));
     group.bench_function("datapath_pipelined", |b| {
         b.to_async(&rt).iter(|| {
-            let tunnel_a = tunnel_a.clone();
-            let rx_b = rx_b.clone();
+            let peer_b = peer_b.clone();
+            let peer_a = peer_a.clone();
             let payload = payload.clone();
             async move {
                 let send_all = async {
                     for _ in 0..BATCH {
-                        tunnel_a.send(pk_b, payload.clone()).await;
+                        peer_b.send(payload.clone()).await.unwrap();
                     }
                 };
                 let recv_all = async {
-                    let mut rx = rx_b.lock().await;
+                    let mut rx = peer_a.lock().await;
                     for _ in 0..BATCH {
                         rx.recv().await.unwrap();
                     }
