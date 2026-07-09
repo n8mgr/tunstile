@@ -1,6 +1,6 @@
 use clap::Parser;
 use etherparse::PacketBuilder;
-use spacetun_tunnel::{PublicKey, StaticSecret, Tunnel};
+use spacetun_tunnel::{PrivateKey, PublicKey, Tunnel};
 use std::{net::SocketAddr, time::Duration};
 use tokio::time::{Instant, interval, sleep_until};
 
@@ -8,19 +8,13 @@ use tokio::time::{Instant, interval, sleep_until};
 /// (testutil/interop). Set RUST_LOG=debug for tunnel internals.
 #[derive(Parser)]
 struct Args {
-    /// our private key (hex)
-    #[arg(
-        long,
-        default_value = "6a77ff2a229f49372a8920e608ff6a066ad2e2762adfdff77018e61b0c7fe833"
-    )]
-    key: String,
+    /// our private key (base64)
+    #[arg(long, default_value = "anf/KiKfSTcqiSDmCP9qBmrS4nYq39/3cBjmGwx/6DM=")]
+    key: PrivateKey,
 
-    /// peer public key (hex)
-    #[arg(
-        long,
-        default_value = "8eba4fe57f66352c6391dead0a71f0751238469f199eab908f7e1402a959a71f"
-    )]
-    peer: String,
+    /// peer public key (base64)
+    #[arg(long, default_value = "jrpP5X9mNSxjkd6tCnHwdRI4Rp8ZnquQj34UAqlZpx8=")]
+    peer: PublicKey,
 
     #[arg(long, default_value = "127.0.0.1:51820")]
     bind: SocketAddr,
@@ -37,27 +31,15 @@ struct Args {
     ping_interval: u64,
 }
 
-fn key_bytes(s: &str) -> [u8; 32] {
-    <[u8; 32]>::try_from(hex::decode(s).expect("invalid hex key")).expect("key must be 32 bytes")
-}
-
 #[tokio::main]
 async fn main() {
     env_logger::init();
     let args = Args::parse();
 
-    let our_private = StaticSecret::from(key_bytes(&args.key));
-    println!(
-        "rust public key (hex): {}",
-        hex::encode(PublicKey::from(&our_private).as_bytes())
-    );
-    let peer_public = PublicKey::from(key_bytes(&args.peer));
+    println!("rust public key: {}", args.key.public_key());
 
-    let tunnel = Tunnel::new(args.bind, our_private).await.unwrap();
-    let mut peer = tunnel
-        .connect_peer(peer_public, args.endpoint)
-        .await
-        .unwrap();
+    let tunnel = Tunnel::new(args.bind, args.key.clone()).await.unwrap();
+    let mut peer = tunnel.connect_peer(args.peer, args.endpoint).await.unwrap();
     println!("sent handshake init; waiting for handshake to complete");
     peer.ready().await.unwrap();
     println!("handshake complete");

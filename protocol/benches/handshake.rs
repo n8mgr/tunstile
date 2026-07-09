@@ -1,16 +1,17 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use spacetun_protocol::PrivateKey;
 use spacetun_protocol::{
     cookies::Generator,
     handshake::{Handshake, INIT_MSG_LENGTH, RESP_MSG_LENGTH},
 };
 use tai64::Tai64N;
-use x25519_dalek::{PublicKey, ReusableSecret, StaticSecret};
+use x25519_dalek::ReusableSecret;
 
 fn bench_handshake(c: &mut Criterion) {
-    let sk1 = StaticSecret::random();
-    let pk1 = PublicKey::from(&sk1);
-    let sk2 = StaticSecret::random();
-    let pk2 = PublicKey::from(&sk2);
+    let sk1 = PrivateKey::from(rand::random::<[u8; 32]>());
+    let pk1 = sk1.public_key();
+    let sk2 = PrivateKey::from(rand::random::<[u8; 32]>());
+    let pk2 = sk2.public_key();
 
     let c_init = Generator::new(pk2);
     let c_resp = Generator::new(pk1);

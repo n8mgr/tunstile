@@ -3,7 +3,9 @@ use core::ops::Range;
 use ring::aead::{CHACHA20_POLY1305, LessSafeKey, UnboundKey};
 use tai64::Tai64N;
 use thiserror::Error;
-use x25519_dalek::{PublicKey, ReusableSecret, StaticSecret};
+use x25519_dalek::{PublicKey as XPublicKey, ReusableSecret, StaticSecret};
+
+use crate::keys::{PrivateKey, PublicKey};
 use zeroize::ZeroizeOnDrop;
 
 use crate::{
@@ -58,8 +60,8 @@ pub enum HandshakeError {
 #[derive(Clone)]
 pub struct Handshake<S> {
     our_private: StaticSecret,
-    our_public: PublicKey,
-    peer_public: PublicKey,
+    our_public: XPublicKey,
+    peer_public: XPublicKey,
 
     state: S,
 }
@@ -77,7 +79,7 @@ pub struct InitSent {
 // responder state
 #[derive(ZeroizeOnDrop)]
 pub struct InitReceived {
-    ephemeral_public_initiator: PublicKey,
+    ephemeral_public_initiator: XPublicKey,
     index_initiator: u32,
 
     constr: Hash256,
@@ -102,13 +104,14 @@ impl Handshake<InitReceived> {
     /// Returns the peer's public key. It
     /// is parsed from the handshake initiation.
     pub fn peer_key(&self) -> PublicKey {
-        self.peer_public
+        PublicKey(self.peer_public)
     }
 
     /// Parses a received handshake initiator message
     ///
     /// Returns an error if the packet is not a valid handshake initiator message.
-    pub fn receive(our_private: StaticSecret, packet: &mut [u8]) -> Result<Self, HandshakeError> {
+    pub fn receive(our_private: PrivateKey, packet: &mut [u8]) -> Result<Self, HandshakeError> {
+        let our_private = our_private.0;
         if packet.len() < INIT_MSG_LENGTH
             || MessageType::try_from(packet[0]) != Ok(MessageType::HandshakeInit)
         {
@@ -120,12 +123,12 @@ impl Handshake<InitReceived> {
                 .try_into()
                 .map_err(|_| HandshakeError::Failed)?,
         );
-        let ephemeral_public_key = PublicKey::from(
+        let ephemeral_public_key = XPublicKey::from(
             <[u8; 32]>::try_from(&packet[INIT_EPHEMERAL_PK]).map_err(|_| HandshakeError::Failed)?,
         );
 
         let constr = INITIAL_CONSTR_HASH;
-        let our_public = PublicKey::from(&our_private);
+        let our_public = XPublicKey::from(&our_private);
         let h = hash(&[INITIAL_IDENTIFIER_HASH, our_public.as_ref()]);
         let [constr] = kdf::<1>(constr, ephemeral_public_key.as_ref());
         let h = hash(&[h.as_ref(), ephemeral_public_key.as_ref()]);
@@ -140,7 +143,7 @@ impl Handshake<InitReceived> {
 
         let mut peer_public = [0u8; 32];
         peer_public.copy_from_slice(&static_pk_buf[..32]);
-        let peer_public = PublicKey::from(peer_public);
+        let peer_public = XPublicKey::from(peer_public);
         let h = h_temp;
 
         let shared_secret = our_private.diffie_hellman(&peer_public);
@@ -192,7 +195,7 @@ impl Handshake<InitReceived> {
         buf[RESP_SENDER].copy_from_slice(&index.to_le_bytes());
         buf[RESP_RECEIVER].copy_from_slice(&self.state.index_initiator.to_le_bytes());
 
-        let ephemeral_public = PublicKey::from(&ephemeral_secret);
+        let ephemeral_public = XPublicKey::from(&ephemeral_secret);
         buf[RESP_EPHEMERAL_PK].copy_from_slice(ephemeral_public.as_ref());
 
         let [constr] = kdf::<1>(self.state.constr.as_ref(), ephemeral_public.as_bytes());
@@ -242,7 +245,7 @@ impl Handshake<InitSent> {
     /// # Returns
     /// A `Handshake<InitSent>` instance.
     pub fn initiate(
-        our_private: StaticSecret,
+        our_private: PrivateKey,
         peer_public: PublicKey,
         sender: u32,
         ephemeral_secret: ReusableSecret,
@@ -253,13 +256,15 @@ impl Handshake<InitSent> {
         if buf.len() != INIT_MSG_LENGTH {
             panic!("buf must be at least INIT_MSG_LENGTH bytes");
         }
+        let our_private = our_private.0;
+        let peer_public = peer_public.0;
         buf[0] = MessageType::HandshakeInit as u8;
         buf[1..4].fill(0);
         buf[INIT_SENDER].copy_from_slice(&sender.to_le_bytes());
 
         let constr = INITIAL_CONSTR_HASH;
         let h = hash(&[INITIAL_IDENTIFIER_HASH, peer_public.as_ref()]);
-        let ephemeral_public_key = PublicKey::from(&ephemeral_secret);
+        let ephemeral_public_key = XPublicKey::from(&ephemeral_secret);
         buf[INIT_EPHEMERAL_PK].copy_from_slice(ephemeral_public_key.as_ref());
 
         let [constr] = kdf::<1>(constr, ephemeral_public_key.as_ref());
@@ -272,7 +277,7 @@ impl Handshake<InitSent> {
                 .expect("encryption failed"),
         );
 
-        let our_public = PublicKey::from(&our_private);
+        let our_public = XPublicKey::from(&our_private);
         buf[INIT_ENCRYPTED_STATIC_PK.start..INIT_ENCRYPTED_STATIC_PK.end - AEAD_TAG_SIZE]
             .copy_from_slice(our_public.as_ref());
 
@@ -335,7 +340,7 @@ impl Handshake<InitSent> {
                 .try_into()
                 .map_err(|_| HandshakeError::Failed)?,
         );
-        let ephemeral_public_key = PublicKey::from(
+        let ephemeral_public_key = XPublicKey::from(
             <[u8; 32]>::try_from(&packet[RESP_EPHEMERAL_PK]).map_err(|_| HandshakeError::Failed)?,
         );
 
@@ -423,10 +428,10 @@ mod test {
         const INITIATOR: u32 = 100;
         const RECEIVER: u32 = 200;
 
-        let sk1 = StaticSecret::random();
-        let pk1 = PublicKey::from(&sk1);
-        let sk2 = StaticSecret::random();
-        let pk2 = PublicKey::from(&sk2);
+        let sk1 = PrivateKey::random();
+        let pk1 = sk1.public_key();
+        let sk2 = PrivateKey::random();
+        let pk2 = sk2.public_key();
 
         let hs_init = ReusableSecret::random();
         let hs_resp = ReusableSecret::random();

@@ -2,9 +2,9 @@ use core::time::Duration;
 
 use subtle::ConstantTimeEq;
 use tai64::Tai64N;
-use x25519_dalek::PublicKey;
 
 use crate::crypto::{Hash256, hash, mac};
+use crate::keys::PublicKey;
 
 const LABEL_MAC_1: &[u8] = b"mac1----";
 const LABEL_COOKIE: &[u8] = b"cookie--";

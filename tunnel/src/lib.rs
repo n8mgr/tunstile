@@ -8,18 +8,17 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use base64::{Engine, prelude::BASE64_STANDARD};
 pub use bytes::Bytes;
 use bytes::BytesMut;
 use log::debug;
 use quinn_udp::{BATCH_SIZE, RecvMeta};
+pub use spacetun_protocol::{KeyParseError, PrivateKey, PublicKey};
 use spacetun_protocol::{
     MessageHeader, ReusableSecret, Tai64N,
     cookies::{Generator, Verifier},
     handshake::{self, Handshake, INIT_MSG_LENGTH, InitReceived, InitSent},
     transport::{ReplayFilter, Transport},
 };
-pub use spacetun_protocol::{PublicKey, StaticSecret};
 use thiserror::Error;
 use tokio::{
     select, spawn,
@@ -56,31 +55,8 @@ pub enum RegisterError {
     AlreadyRegistered,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum KeyParseError {
-    #[error("invalid base64")]
-    InvalidEncoding,
-
-    #[error("invalid key length")]
-    InvalidLength,
-}
-
-/// Decodes a key from the standard WireGuard base64 encoding. Convert with
-/// `PublicKey::from` or `StaticSecret::from`.
-pub fn key_from_base64(s: &str) -> Result<[u8; 32], KeyParseError> {
-    let bytes = BASE64_STANDARD
-        .decode(s)
-        .map_err(|_| KeyParseError::InvalidEncoding)?;
-    <[u8; 32]>::try_from(bytes).map_err(|_| KeyParseError::InvalidLength)
-}
-
-/// Encodes a key in the standard WireGuard base64 encoding.
-pub fn key_to_base64(key: &[u8; 32]) -> String {
-    BASE64_STANDARD.encode(key)
-}
-
 fn peer_label(key: &PublicKey) -> String {
-    let b64 = key_to_base64(key.as_bytes());
+    let b64 = key.to_string();
     format!("{}…{}", &b64[..4], &b64[39..43])
 }
 
@@ -160,7 +136,7 @@ struct Session {
 }
 
 struct PeerActor {
-    our_key: StaticSecret,
+    our_key: PrivateKey,
     peer_key: PublicKey,
     label: String,
     endpoint: Option<SocketAddr>,
@@ -900,7 +876,7 @@ impl futures_core::Stream for Peer {
 }
 
 pub struct Tunnel {
-    our_key: StaticSecret,
+    our_key: PrivateKey,
     socket: Arc<UdpSocket>,
     router: Arc<RoutingTable>,
     read_task: JoinHandle<()>,
@@ -913,11 +889,7 @@ impl Drop for Tunnel {
 }
 
 impl Tunnel {
-    async fn read_loop(
-        our_private: StaticSecret,
-        socket: Arc<UdpSocket>,
-        router: Arc<RoutingTable>,
-    ) {
+    async fn read_loop(our_private: PrivateKey, socket: Arc<UdpSocket>, router: Arc<RoutingTable>) {
         let mut bufs = vec![vec![0u8; MAX_MESSAGE_SIZE]; BATCH_SIZE];
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
         loop {
@@ -1052,7 +1024,7 @@ impl Tunnel {
         self.router.peer_status(peer)
     }
 
-    pub async fn new(addr: SocketAddr, our_key: StaticSecret) -> io::Result<Self> {
+    pub async fn new(addr: SocketAddr, our_key: PrivateKey) -> io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         let router = Arc::new(RoutingTable::new());
         let read_task = spawn(Self::read_loop(
@@ -1073,6 +1045,8 @@ impl Tunnel {
 mod tests {
     use spacetun_protocol::handshake::RESP_MSG_LENGTH;
 
+    use base64::{Engine, prelude::BASE64_STANDARD};
+
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1082,10 +1056,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn tunnel_e2e() {
-        let sk_a = StaticSecret::random();
-        let pk_a = PublicKey::from(&sk_a);
-        let sk_b = StaticSecret::random();
-        let pk_b = PublicKey::from(&sk_b);
+        let sk_a = PrivateKey::random();
+        let pk_a = sk_a.public_key();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
@@ -1145,10 +1119,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn staged_send() {
-        let sk_a = StaticSecret::random();
-        let pk_a = PublicKey::from(&sk_a);
-        let sk_b = StaticSecret::random();
-        let pk_b = PublicKey::from(&sk_b);
+        let sk_a = PrivateKey::random();
+        let pk_a = sk_a.public_key();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
@@ -1172,10 +1146,10 @@ mod tests {
     // possible) until the peer connects to us.
     #[tokio::test(flavor = "multi_thread")]
     async fn send_before_endpoint_known() {
-        let sk_a = StaticSecret::random();
-        let pk_a = PublicKey::from(&sk_a);
-        let sk_b = StaticSecret::random();
-        let pk_b = PublicKey::from(&sk_b);
+        let sk_a = PrivateKey::random();
+        let pk_a = sk_a.public_key();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
@@ -1199,9 +1173,9 @@ mod tests {
     // which requires the tunnel drop to release the routing table
     #[tokio::test(flavor = "multi_thread")]
     async fn drop_terminates_actors() {
-        let sk_a = StaticSecret::random();
-        let sk_b = StaticSecret::random();
-        let pk_b = PublicKey::from(&sk_b);
+        let sk_a = PrivateKey::random();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let mut peer_b = tunnel_a.allow_peer(pk_b).unwrap();
@@ -1219,9 +1193,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn peer_registration() {
-        let sk_a = StaticSecret::random();
-        let sk_b = StaticSecret::random();
-        let pk_b = PublicKey::from(&sk_b);
+        let sk_a = PrivateKey::random();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let peer_b = tunnel_a.allow_peer(pk_b).unwrap();
@@ -1239,10 +1213,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn preshared_key() {
-        let sk_a = StaticSecret::random();
-        let pk_a = PublicKey::from(&sk_a);
-        let sk_b = StaticSecret::random();
-        let pk_b = PublicKey::from(&sk_b);
+        let sk_a = PrivateKey::random();
+        let pk_a = sk_a.public_key();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
         let psk = [7u8; 32];
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
@@ -1276,10 +1250,10 @@ mod tests {
     // invalid response must not trigger an immediate re-initiation storm
     #[tokio::test(flavor = "multi_thread")]
     async fn preshared_key_mismatch() {
-        let sk_a = StaticSecret::random();
-        let pk_a = PublicKey::from(&sk_a);
-        let sk_b = StaticSecret::random();
-        let pk_b = PublicKey::from(&sk_b);
+        let sk_a = PrivateKey::random();
+        let pk_a = sk_a.public_key();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
@@ -1309,10 +1283,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn persistent_keepalive() {
-        let sk_a = StaticSecret::random();
-        let pk_a = PublicKey::from(&sk_a);
-        let sk_b = StaticSecret::random();
-        let pk_b = PublicKey::from(&sk_b);
+        let sk_a = PrivateKey::random();
+        let pk_a = sk_a.public_key();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
@@ -1343,18 +1317,27 @@ mod tests {
 
     #[test]
     fn key_base64_roundtrip() {
-        let secret = StaticSecret::random();
-        let encoded = key_to_base64(PublicKey::from(&secret).as_bytes());
+        let secret = PrivateKey::random();
+        let public = secret.public_key();
+        let encoded = public.to_string();
         assert_eq!(encoded.len(), 44);
-        let decoded = key_from_base64(&encoded).unwrap();
-        assert_eq!(&decoded, PublicKey::from(&secret).as_bytes());
+        assert_eq!(encoded.parse::<PublicKey>().unwrap(), public);
+        assert_eq!(
+            secret
+                .to_base64()
+                .parse::<PrivateKey>()
+                .unwrap()
+                .public_key(),
+            public
+        );
+        assert_eq!(format!("{secret:?}"), "PrivateKey(…)");
 
         assert_eq!(
-            key_from_base64("not base64!").err(),
+            "!".repeat(44).parse::<PublicKey>().err(),
             Some(KeyParseError::InvalidEncoding)
         );
         assert_eq!(
-            key_from_base64(&BASE64_STANDARD.encode([0u8; 16])).err(),
+            BASE64_STANDARD.encode([0u8; 16]).parse::<PublicKey>().err(),
             Some(KeyParseError::InvalidLength)
         );
     }

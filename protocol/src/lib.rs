@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 const AEAD_TAG_SIZE: usize = 16;
 const MAC_SIZE: usize = 16;
@@ -79,11 +79,13 @@ impl TryFrom<&[u8]> for MessageHeader {
 }
 
 mod crypto;
+mod keys;
 pub mod transport;
 
 pub mod cookies;
 pub mod handshake;
 
+pub use keys::{KeyParseError, PrivateKey, PublicKey};
 pub use tai64::*;
 use thiserror::Error;
-pub use x25519_dalek::{PublicKey, ReusableSecret, StaticSecret};
+pub use x25519_dalek::ReusableSecret;

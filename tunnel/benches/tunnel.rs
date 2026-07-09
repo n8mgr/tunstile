@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use spacetun_tunnel::{Bytes, Peer, PublicKey, StaticSecret, Tunnel};
+use spacetun_tunnel::{Bytes, Peer, PrivateKey, Tunnel};
 use tokio::{runtime::Runtime, sync::Mutex};
 
 const PAYLOAD_LEN: usize = 1420;
@@ -17,10 +17,10 @@ type Established = (Tunnel, Tunnel, Arc<Peer>, Arc<Mutex<Peer>>);
 fn setup(rt: &Runtime) -> Established {
     let _ = env_logger::try_init();
     rt.block_on(async {
-        let sk_a = StaticSecret::random();
-        let pk_a = PublicKey::from(&sk_a);
-        let sk_b = StaticSecret::random();
-        let pk_b = PublicKey::from(&sk_b);
+        let sk_a = PrivateKey::random();
+        let pk_a = sk_a.public_key();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
