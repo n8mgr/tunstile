@@ -17,7 +17,7 @@ use spacetun_protocol::{
     MessageHeader, ReusableSecret, Tai64N,
     cookies::{Generator, Verifier},
     handshake::{self, Handshake, INIT_MSG_LENGTH, InitReceived, InitSent},
-    transport::Transport,
+    transport::{ReplayFilter, Transport},
 };
 pub use spacetun_protocol::{PublicKey, StaticSecret};
 use thiserror::Error;
@@ -31,13 +31,10 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-mod pool;
 mod socket;
-use pool::{BufferPool, RefGuard};
 use socket::UdpSocket;
 
 const MAX_MESSAGE_SIZE: usize = 65535;
-const BUFFER_POOL_SIZE: usize = 256;
 const MAX_STAGED_PACKETS: usize = 128;
 const PEER_INBOUND_QUEUE: usize = 1024;
 
@@ -119,9 +116,9 @@ impl PeerConfig {
 enum PeerAction {
     Connect(SocketAddr),
     SendData(Bytes),
-    RecvData(RefGuard, SocketAddr),
+    RecvData(Vec<u8>, u32, SocketAddr),
     RecvHandshakeInit(Handshake<InitReceived>, SocketAddr),
-    RecvHandshakeResp(RefGuard, SocketAddr),
+    RecvHandshakeResp(Vec<u8>, SocketAddr),
 }
 
 #[derive(Clone, Debug)]
@@ -149,8 +146,9 @@ struct Session {
     initiator: bool,
     established: Instant,
     last_send: Instant,
+    replay: ReplayFilter,
 
-    // passive keepalive owed to the peer, armed on receiving data
+    // passive keepalive owed to the peer
     keepalive_at: Option<Instant>,
     // first data send with no authenticated receive since
     unanswered_send: Option<Instant>,
@@ -173,12 +171,16 @@ struct PeerActor {
     persistent_keepalive: Option<Duration>,
 
     pending_handshake: Option<PendingHandshake>,
-    session: Option<Session>,
+    // send session; initiator-established sessions land here directly
+    current: Option<Session>,
+    // responder-established session awaiting its first authenticated packet
+    next: Option<Session>,
+    // receive-only grace for packets in flight across a rekey
+    previous: Option<Session>,
     session_tx: watch::Sender<bool>,
     staged: VecDeque<Bytes>,
 
     socket: Arc<UdpSocket>,
-    pool: Arc<BufferPool>,
 
     status: Arc<RwLock<PeerStatus>>,
 
@@ -186,21 +188,33 @@ struct PeerActor {
 }
 
 impl PeerActor {
-    fn establish_session(&mut self, transport: Transport, initiator: bool, endpoint: SocketAddr) {
+    fn new_session(transport: Transport, initiator: bool) -> Session {
         let now = Instant::now();
-        let old = self.session.replace(Session {
+        Session {
             transport: Arc::new(transport),
             initiator,
             established: now,
             last_send: now,
+            replay: ReplayFilter::new(),
             keepalive_at: None,
             unanswered_send: None,
-        });
-        if let (Some(old), Some(router)) = (old, self.router.upgrade()) {
-            router.retire_index(old.transport.our_index());
         }
+    }
+
+    fn retire_session(&self, session: Session) {
+        if let Some(router) = self.router.upgrade() {
+            router.retire_index(session.transport.our_index());
+        }
+    }
+
+    /// Callers signal `session_tx` once the adopted session is usable.
+    fn adopt_current(&mut self, session: Session, endpoint: SocketAddr) {
+        let old = std::mem::replace(&mut self.previous, self.current.take());
+        if let Some(old) = old {
+            self.retire_session(old);
+        }
+        self.current = Some(session);
         self.endpoint = Some(endpoint);
-        self.session_tx.send_replace(true);
     }
 
     fn update_status<F>(&self, mut func: F)
@@ -221,9 +235,19 @@ impl PeerActor {
                 let mut payloads = vec![payload];
                 self.flush_sends(&mut payloads).await;
             }
-            PeerAction::RecvData(mut data, endpoint) => {
+            PeerAction::RecvData(mut data, receiver, endpoint) => {
                 let now = Instant::now();
-                let Some(session) = &self.session else {
+                let matches = |s: &Option<Session>| {
+                    s.as_ref()
+                        .is_some_and(|s| s.transport.our_index() == receiver)
+                };
+                let (session, unconfirmed) = if matches(&self.next) {
+                    (self.next.as_mut().unwrap(), true)
+                } else if matches(&self.current) {
+                    (self.current.as_mut().unwrap(), false)
+                } else if matches(&self.previous) {
+                    (self.previous.as_mut().unwrap(), false)
+                } else {
                     return;
                 };
                 if now.duration_since(session.established) >= REJECT_AFTER_TIME {
@@ -231,32 +255,46 @@ impl PeerActor {
                 }
                 let transport = session.transport.clone();
                 let rx_bytes = data.len() as u64;
-                match transport.receive(&mut data) {
-                    Ok(payload) => {
-                        let payload =
-                            (!payload.is_empty()).then(|| Bytes::copy_from_slice(payload));
-                        let session = self.session.as_mut().unwrap();
-                        session.unanswered_send = None;
-                        if payload.is_some() && session.keepalive_at.is_none() {
-                            session.keepalive_at = Some(now + KEEPALIVE_TIMEOUT);
-                        }
-                        self.endpoint = Some(endpoint);
-                        self.update_status(|status| {
-                            status.endpoint = Some(endpoint);
-                            status.rx_bytes += rx_bytes;
-                            status.last_recv = Some(SystemTime::now());
-                        });
-                        if let Some(payload) = payload {
-                            // drop on a full queue rather than await: a slow or absent
-                            // reader must not stall the actor's timers and handshakes
-                            if let Err(mpsc::error::TrySendError::Full(_)) =
-                                self.data_tx.try_send(payload)
-                            {
-                                debug!("dropping inbound packet: receive queue full");
-                            }
-                        }
+                let (counter, payload) = match transport.receive(&mut data) {
+                    Ok(decrypted) => decrypted,
+                    Err(e) => {
+                        debug!("failed to decrypt inbound packet: {:?}", e);
+                        return;
                     }
-                    Err(e) => debug!("failed to decrypt inbound packet: {:?}", e),
+                };
+                if !session.replay.validate(counter) {
+                    debug!("dropping replayed packet: counter {counter}");
+                    return;
+                }
+                let payload = (!payload.is_empty()).then(|| Bytes::copy_from_slice(payload));
+
+                self.endpoint = Some(endpoint);
+                self.update_status(|status| {
+                    status.endpoint = Some(endpoint);
+                    status.rx_bytes += rx_bytes;
+                    status.last_recv = Some(SystemTime::now());
+                });
+                if unconfirmed {
+                    let session = self.next.take().unwrap();
+                    self.adopt_current(session, endpoint);
+                    self.session_tx.send_replace(true);
+                }
+                if let Some(current) = self.current.as_mut() {
+                    current.unanswered_send = None;
+                    if payload.is_some() && current.keepalive_at.is_none() {
+                        current.keepalive_at = Some(now + KEEPALIVE_TIMEOUT);
+                    }
+                }
+                if let Some(payload) = payload {
+                    // drop on a full queue rather than await: a slow or absent
+                    // reader must not stall the actor's timers and handshakes
+                    if let Err(mpsc::error::TrySendError::Full(_)) = self.data_tx.try_send(payload)
+                    {
+                        debug!("dropping inbound packet: receive queue full");
+                    }
+                }
+                if unconfirmed {
+                    self.flush_staged().await;
                 }
             }
             PeerAction::RecvHandshakeInit(handshake, endpoint) => {
@@ -290,8 +328,11 @@ impl PeerActor {
                     status.last_send = Some(SystemTime::now());
                     status.last_successful_handshake = Some(SystemTime::now());
                 });
-                self.establish_session(new_transport, false, endpoint);
-                self.flush_staged().await;
+                let session = Self::new_session(new_transport, false);
+                if let Some(old) = self.next.replace(session) {
+                    self.retire_session(old);
+                }
+                self.endpoint = Some(endpoint);
             }
             PeerAction::RecvHandshakeResp(mut resp, endpoint) => {
                 let rx_bytes = resp.len() as u64;
@@ -312,8 +353,14 @@ impl PeerActor {
                             status.last_recv = Some(SystemTime::now());
                             status.last_successful_handshake = Some(SystemTime::now());
                         });
-                        self.establish_session(established.finish(), true, endpoint);
+                        let had_staged = !self.staged.is_empty();
+                        self.adopt_current(Self::new_session(established.finish(), true), endpoint);
                         self.flush_staged().await;
+                        if !had_staged {
+                            // confirm the session to the responder
+                            self.send_keepalive().await;
+                        }
+                        self.session_tx.send_replace(true);
                     }
                     // an invalid response is dropped; the pending handshake keeps
                     // its retransmit schedule
@@ -387,18 +434,19 @@ impl PeerActor {
             return;
         }
         let now = Instant::now();
-        let usable = self.endpoint.and_then(|endpoint| {
-            self.session.as_ref().and_then(|session| {
-                (now.duration_since(session.established) < REJECT_AFTER_TIME).then(|| {
-                    (
-                        endpoint,
-                        session.transport.clone(),
-                        session.initiator,
-                        session.established,
-                    )
-                })
-            })
-        });
+        let usable = match (self.endpoint, self.current.as_ref()) {
+            (Some(endpoint), Some(session))
+                if now.duration_since(session.established) < REJECT_AFTER_TIME =>
+            {
+                Some((
+                    endpoint,
+                    session.transport.clone(),
+                    session.initiator,
+                    session.established,
+                ))
+            }
+            _ => None,
+        };
         let Some((endpoint, transport, initiator, established)) = usable else {
             self.stage(payloads);
             self.ensure_handshake(now).await;
@@ -416,8 +464,7 @@ impl PeerActor {
             {
                 end += 1;
             }
-            let mut batch = self.pool.clone().pop();
-            batch.resize((end - start) * segment_size, 0);
+            let mut batch = vec![0u8; (end - start) * segment_size];
             for (payload, buf) in payloads[start..end]
                 .iter()
                 .zip(batch.chunks_mut(segment_size))
@@ -441,7 +488,7 @@ impl PeerActor {
             start = end;
         }
         payloads.clear();
-        if sent && let Some(session) = self.session.as_mut() {
+        if sent && let Some(session) = self.current.as_mut() {
             session.last_send = now;
             session.keepalive_at = None;
             session.unanswered_send.get_or_insert(now);
@@ -455,18 +502,17 @@ impl PeerActor {
     }
 
     async fn send_keepalive(&mut self) {
-        let (Some(endpoint), Some(session)) = (self.endpoint, self.session.as_ref()) else {
+        let (Some(endpoint), Some(session)) = (self.endpoint, self.current.as_ref()) else {
             return;
         };
         let transport = session.transport.clone();
-        let mut msg = self.pool.clone().pop();
-        msg.resize(Transport::packet_len(0), 0);
+        let mut msg = vec![0u8; Transport::packet_len(0)];
         transport.send(&[], &mut msg);
         if let Err(e) = self.socket.send(endpoint, &msg).await {
             debug!("failed to send keepalive: {:?}", e);
             return;
         }
-        if let Some(session) = self.session.as_mut() {
+        if let Some(session) = self.current.as_mut() {
             session.last_send = Instant::now();
             session.keepalive_at = None;
         }
@@ -482,7 +528,7 @@ impl PeerActor {
             .as_ref()
             .map(|pending| pending.last_sent + REKEY_TIMEOUT);
         let (keepalive, silence, persistent) = self
-            .session
+            .current
             .as_ref()
             .map(|session| {
                 (
@@ -495,7 +541,11 @@ impl PeerActor {
                 )
             })
             .unwrap_or((None, None, None));
-        [retransmit, keepalive, silence, persistent]
+        let expiry = [&self.previous, &self.current, &self.next]
+            .into_iter()
+            .filter_map(|s| s.as_ref().map(|s| s.established + REJECT_AFTER_TIME))
+            .min();
+        [retransmit, keepalive, silence, persistent, expiry]
             .into_iter()
             .flatten()
             .min()
@@ -503,6 +553,16 @@ impl PeerActor {
 
     async fn tick(&mut self) {
         let now = Instant::now();
+        let router = self.router.upgrade();
+        for slot in [&mut self.previous, &mut self.current, &mut self.next] {
+            if slot
+                .as_ref()
+                .is_some_and(|s| now.duration_since(s.established) >= REJECT_AFTER_TIME)
+                && let (Some(session), Some(router)) = (slot.take(), router.as_ref())
+            {
+                router.retire_index(session.transport.our_index());
+            }
+        }
         if let Some(pending) = &self.pending_handshake
             && now >= pending.last_sent + REKEY_TIMEOUT
         {
@@ -520,7 +580,7 @@ impl PeerActor {
         }
         let mut keepalive = false;
         let mut silent = false;
-        if let Some(session) = self.session.as_mut() {
+        if let Some(session) = self.current.as_mut() {
             if session.keepalive_at.is_some_and(|t| now >= t) {
                 session.keepalive_at = None;
                 keepalive = true;
@@ -711,7 +771,7 @@ impl RoutingTable {
         &self,
         endpoint: SocketAddr,
         peer_index: u32,
-        packet: RefGuard,
+        packet: Vec<u8>,
     ) -> bool {
         if let Some(sender) = self.peer_index_sender(peer_index) {
             let _ = sender
@@ -722,9 +782,11 @@ impl RoutingTable {
         false
     }
 
-    async fn recv_data(&self, endpoint: SocketAddr, peer_index: u32, packet: RefGuard) -> bool {
+    async fn recv_data(&self, endpoint: SocketAddr, peer_index: u32, packet: Vec<u8>) -> bool {
         if let Some(sender) = self.peer_index_sender(peer_index) {
-            let _ = sender.send(PeerAction::RecvData(packet, endpoint)).await;
+            let _ = sender
+                .send(PeerAction::RecvData(packet, peer_index, endpoint))
+                .await;
             return true;
         }
         false
@@ -781,13 +843,12 @@ impl Peer {
     /// Resolves once a session is established with the peer. Errors if the
     /// tunnel is dropped first.
     pub async fn ready(&self) -> Result<(), SendError> {
-        let mut session_rx = self.session_rx.clone();
-        loop {
-            if *session_rx.borrow_and_update() {
-                return Ok(());
-            }
-            session_rx.changed().await.map_err(|_| SendError::Closed)?;
-        }
+        self.session_rx
+            .clone()
+            .wait_for(|ready| *ready)
+            .await
+            .map(|_| ())
+            .map_err(|_| SendError::Closed)
     }
 }
 
@@ -803,7 +864,6 @@ pub struct Tunnel {
     our_key: StaticSecret,
     socket: Arc<UdpSocket>,
     router: Arc<RoutingTable>,
-    pool: Arc<BufferPool>,
     read_task: JoinHandle<()>,
 }
 
@@ -818,7 +878,6 @@ impl Tunnel {
         our_private: StaticSecret,
         socket: Arc<UdpSocket>,
         router: Arc<RoutingTable>,
-        pool: Arc<BufferPool>,
     ) {
         let mut bufs = vec![vec![0u8; MAX_MESSAGE_SIZE]; BATCH_SIZE];
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
@@ -863,16 +922,14 @@ impl Tunnel {
                             }
                         }
                         MessageHeader::HandshakeResponse { receiver } => {
-                            let mut packet = pool.clone().pop();
-                            packet.extend_from_slice(segment);
                             let _ = router
-                                .recv_handshake_resp(meta.addr, receiver, packet)
+                                .recv_handshake_resp(meta.addr, receiver, segment.to_vec())
                                 .await;
                         }
                         MessageHeader::Data { receiver } => {
-                            let mut packet = pool.clone().pop();
-                            packet.extend_from_slice(segment);
-                            let _ = router.recv_data(meta.addr, receiver, packet).await;
+                            let _ = router
+                                .recv_data(meta.addr, receiver, segment.to_vec())
+                                .await;
                         }
                         MessageHeader::CookieReply { receiver: _ } => {
                             unimplemented!()
@@ -898,14 +955,15 @@ impl Tunnel {
                 endpoint: None,
                 router: Arc::downgrade(&self.router),
                 socket: self.socket.clone(),
-                pool: self.pool.clone(),
                 cookie_generator: Generator::new(peer_key),
                 cookie_verifier: Verifier::new(peer_key),
                 preshared_key: config.preshared_key,
                 persistent_keepalive: config.persistent_keepalive,
                 status: status.clone(),
                 pending_handshake: None,
-                session: None,
+                current: None,
+                next: None,
+                previous: None,
                 session_tx,
                 staged: VecDeque::new(),
                 data_tx,
@@ -957,18 +1015,15 @@ impl Tunnel {
     pub async fn new(addr: SocketAddr, our_key: StaticSecret) -> io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         let router = Arc::new(RoutingTable::new());
-        let pool = Arc::new(BufferPool::new(BUFFER_POOL_SIZE));
         let read_task = spawn(Self::read_loop(
             our_key.clone(),
             socket.clone(),
             router.clone(),
-            pool.clone(),
         ));
         Ok(Self {
             our_key,
             socket,
             router,
-            pool,
             read_task,
         })
     }
@@ -1003,15 +1058,17 @@ mod tests {
         peer_b.ready().await.unwrap();
         peer_a.ready().await.unwrap();
 
+        // the initiator confirms the session with a keepalive
+        let keepalive_len = Transport::packet_len(0) as u64;
         let stat = peer_b.status();
-        assert_eq!(stat.tx_bytes, INIT_MSG_LENGTH as u64);
+        assert_eq!(stat.tx_bytes, INIT_MSG_LENGTH as u64 + keepalive_len);
         assert_eq!(stat.rx_bytes, RESP_MSG_LENGTH as u64);
         let a_rx = stat.rx_bytes;
         let a_tx = stat.tx_bytes;
 
         let stat = peer_a.status();
         assert_eq!(stat.tx_bytes, RESP_MSG_LENGTH as u64);
-        assert_eq!(stat.rx_bytes, INIT_MSG_LENGTH as u64);
+        assert_eq!(stat.rx_bytes, INIT_MSG_LENGTH as u64 + keepalive_len);
         let b_rx = stat.rx_bytes;
         let b_tx = stat.tx_bytes;
 
