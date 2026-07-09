@@ -1,46 +1,70 @@
+use clap::Parser;
 use etherparse::PacketBuilder;
 use spacetun_tunnel::{PublicKey, StaticSecret, Tunnel};
 use std::{net::SocketAddr, time::Duration};
 use tokio::time::{Instant, interval, sleep_until};
 
-// long enough to cross Rekey-After-Time (120s) with traffic on both sides
-const RUN_TIME: Duration = Duration::from_secs(200);
-const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// Exercises a spacetun tunnel against a reference WireGuard peer
+/// (testutil/interop). Set RUST_LOG=debug for tunnel internals.
+#[derive(Parser)]
+struct Args {
+    /// our private key (hex)
+    #[arg(
+        long,
+        default_value = "6a77ff2a229f49372a8920e608ff6a066ad2e2762adfdff77018e61b0c7fe833"
+    )]
+    key: String,
+
+    /// peer public key (hex)
+    #[arg(
+        long,
+        default_value = "8eba4fe57f66352c6391dead0a71f0751238469f199eab908f7e1402a959a71f"
+    )]
+    peer: String,
+
+    #[arg(long, default_value = "127.0.0.1:51820")]
+    bind: SocketAddr,
+
+    #[arg(long, default_value = "127.0.0.1:51821")]
+    endpoint: SocketAddr,
+
+    /// run time in seconds; the default crosses Rekey-After-Time (120s)
+    #[arg(long, default_value_t = 200)]
+    duration: u64,
+
+    /// seconds between pings
+    #[arg(long, default_value_t = 20)]
+    ping_interval: u64,
+}
+
+fn key_bytes(s: &str) -> [u8; 32] {
+    <[u8; 32]>::try_from(hex::decode(s).expect("invalid hex key")).expect("key must be 32 bytes")
+}
 
 #[tokio::main]
 async fn main() {
-    let our_private = StaticSecret::from(
-        <[u8; 32]>::try_from(
-            hex::decode("6a77ff2a229f49372a8920e608ff6a066ad2e2762adfdff77018e61b0c7fe833")
-                .unwrap(),
-        )
-        .unwrap(),
-    );
+    env_logger::init();
+    let args = Args::parse();
+
+    let our_private = StaticSecret::from(key_bytes(&args.key));
     println!(
         "rust public key (hex): {}",
         hex::encode(PublicKey::from(&our_private).as_bytes())
     );
+    let peer_public = PublicKey::from(key_bytes(&args.peer));
 
-    let go_public = PublicKey::from(
-        <[u8; 32]>::try_from(
-            hex::decode("8eba4fe57f66352c6391dead0a71f0751238469f199eab908f7e1402a959a71f")
-                .unwrap(),
-        )
-        .unwrap(),
-    );
-
-    let bind: SocketAddr = "127.0.0.1:51820".parse().unwrap();
-    let go_addr: SocketAddr = "127.0.0.1:51821".parse().unwrap();
-
-    let tunnel = Tunnel::new(bind, our_private).await.unwrap();
-    let mut peer = tunnel.connect_peer(go_public, go_addr).await.unwrap();
+    let tunnel = Tunnel::new(args.bind, our_private).await.unwrap();
+    let mut peer = tunnel
+        .connect_peer(peer_public, args.endpoint)
+        .await
+        .unwrap();
     println!("sent handshake init; waiting for handshake to complete");
     peer.ready().await.unwrap();
     println!("handshake complete");
 
     let started = Instant::now();
-    let end = started + RUN_TIME;
-    let mut ping = interval(PING_INTERVAL);
+    let end = started + Duration::from_secs(args.duration);
+    let mut ping = interval(Duration::from_secs(args.ping_interval));
     let mut seq = 0u32;
     loop {
         tokio::select! {

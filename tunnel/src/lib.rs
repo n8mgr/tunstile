@@ -79,6 +79,11 @@ pub fn key_to_base64(key: &[u8; 32]) -> String {
     BASE64_STANDARD.encode(key)
 }
 
+fn peer_label(key: &PublicKey) -> String {
+    let b64 = key_to_base64(key.as_bytes());
+    format!("{}…{}", &b64[..4], &b64[39..43])
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
     public_key: PublicKey,
@@ -157,6 +162,7 @@ struct Session {
 struct PeerActor {
     our_key: StaticSecret,
     peer_key: PublicKey,
+    label: String,
     endpoint: Option<SocketAddr>,
 
     // weak so dropping the Tunnel terminates the peer actors
@@ -258,12 +264,15 @@ impl PeerActor {
                 let (counter, payload) = match transport.receive(&mut data) {
                     Ok(decrypted) => decrypted,
                     Err(e) => {
-                        debug!("failed to decrypt inbound packet: {:?}", e);
+                        debug!("[{}] failed to decrypt inbound packet: {:?}", self.label, e);
                         return;
                     }
                 };
                 if !session.replay.validate(counter) {
-                    debug!("dropping replayed packet: counter {counter}");
+                    debug!(
+                        "[{}] dropping replayed packet: counter {counter}",
+                        self.label
+                    );
                     return;
                 }
                 let payload = (!payload.is_empty()).then(|| Bytes::copy_from_slice(payload));
@@ -274,7 +283,11 @@ impl PeerActor {
                     status.rx_bytes += rx_bytes;
                     status.last_recv = Some(SystemTime::now());
                 });
+                if self.endpoint != Some(endpoint) {
+                    debug!("[{}] endpoint updated to {}", self.label, endpoint);
+                }
                 if unconfirmed {
+                    debug!("[{}] session confirmed", self.label);
                     let session = self.next.take().unwrap();
                     self.adopt_current(session, endpoint);
                     self.session_tx.send_replace(true);
@@ -290,7 +303,10 @@ impl PeerActor {
                     // reader must not stall the actor's timers and handshakes
                     if let Err(mpsc::error::TrySendError::Full(_)) = self.data_tx.try_send(payload)
                     {
-                        debug!("dropping inbound packet: receive queue full");
+                        debug!(
+                            "[{}] dropping inbound packet: receive queue full",
+                            self.label
+                        );
                     }
                 }
                 if unconfirmed {
@@ -313,7 +329,10 @@ impl PeerActor {
                     )
                     .finish();
                 if let Err(e) = self.socket.send(endpoint, &msg).await {
-                    debug!("failed to send handshake response: {:?}", e);
+                    debug!(
+                        "[{}] failed to send handshake response: {:?}",
+                        self.label, e
+                    );
                     return;
                 }
                 let Some(router) = self.router.upgrade() else {
@@ -328,6 +347,10 @@ impl PeerActor {
                     status.last_send = Some(SystemTime::now());
                     status.last_successful_handshake = Some(SystemTime::now());
                 });
+                debug!(
+                    "[{}] received handshake initiation from {}; sent response",
+                    self.label, endpoint
+                );
                 let session = Self::new_session(new_transport, false);
                 if let Some(old) = self.next.replace(session) {
                     self.retire_session(old);
@@ -337,7 +360,7 @@ impl PeerActor {
             PeerAction::RecvHandshakeResp(mut resp, endpoint) => {
                 let rx_bytes = resp.len() as u64;
                 let Some(pending) = self.pending_handshake.as_ref() else {
-                    debug!("dropping unexpected handshake response");
+                    debug!("[{}] dropping unexpected handshake response", self.label);
                     return;
                 };
                 match pending
@@ -353,6 +376,7 @@ impl PeerActor {
                             status.last_recv = Some(SystemTime::now());
                             status.last_successful_handshake = Some(SystemTime::now());
                         });
+                        debug!("[{}] handshake complete; session established", self.label);
                         let had_staged = !self.staged.is_empty();
                         self.adopt_current(Self::new_session(established.finish(), true), endpoint);
                         self.flush_staged().await;
@@ -364,7 +388,10 @@ impl PeerActor {
                     }
                     // an invalid response is dropped; the pending handshake keeps
                     // its retransmit schedule
-                    Err(e) => debug!("dropping invalid handshake response: {:?}", e),
+                    Err(e) => debug!(
+                        "[{}] dropping invalid handshake response: {:?}",
+                        self.label, e
+                    ),
                 }
             }
         }
@@ -397,9 +424,13 @@ impl PeerActor {
         }
         router.bind_index(&self.peer_key, our_index);
         if let Err(e) = self.socket.send(endpoint, &msg).await {
-            debug!("failed to send handshake init: {:?}", e);
+            debug!(
+                "[{}] failed to send handshake initiation: {:?}",
+                self.label, e
+            );
             return;
         }
+        debug!("[{}] sent handshake initiation to {}", self.label, endpoint);
         self.update_status(|status| {
             status.tx_bytes += msg.len() as u64;
             status.last_send = Some(SystemTime::now());
@@ -483,7 +514,7 @@ impl PeerActor {
                         status.last_send = Some(SystemTime::now());
                     });
                 }
-                Err(e) => debug!("failed to send outbound packets: {:?}", e),
+                Err(e) => debug!("[{}] failed to send outbound packets: {:?}", self.label, e),
             }
             start = end;
         }
@@ -509,9 +540,10 @@ impl PeerActor {
         let mut msg = vec![0u8; Transport::packet_len(0)];
         transport.send(&[], &mut msg);
         if let Err(e) = self.socket.send(endpoint, &msg).await {
-            debug!("failed to send keepalive: {:?}", e);
+            debug!("[{}] failed to send keepalive: {:?}", self.label, e);
             return;
         }
+        debug!("[{}] sent keepalive", self.label);
         if let Some(session) = self.current.as_mut() {
             session.last_send = Instant::now();
             session.keepalive_at = None;
@@ -560,6 +592,7 @@ impl PeerActor {
                 .is_some_and(|s| now.duration_since(s.established) >= REJECT_AFTER_TIME)
                 && let (Some(session), Some(router)) = (slot.take(), router.as_ref())
             {
+                debug!("[{}] session expired", self.label);
                 router.retire_index(session.transport.our_index());
             }
         }
@@ -567,6 +600,10 @@ impl PeerActor {
             && now >= pending.last_sent + REKEY_TIMEOUT
         {
             if now.duration_since(pending.first_sent) >= REKEY_ATTEMPT_TIME {
+                debug!(
+                    "[{}] handshake abandoned after {:?}",
+                    self.label, REKEY_ATTEMPT_TIME
+                );
                 let our_index = pending.our_index;
                 self.pending_handshake = None;
                 self.staged.clear();
@@ -608,6 +645,7 @@ impl PeerActor {
     }
 
     pub async fn run(mut self, mut rx: Receiver<PeerAction>) {
+        debug!("[{}] peer added", self.label);
         let mut actions = Vec::with_capacity(BATCH_SIZE);
         let mut payloads = Vec::with_capacity(BATCH_SIZE);
         loop {
@@ -615,6 +653,7 @@ impl PeerActor {
             select! {
                 n = rx.recv_many(&mut actions, BATCH_SIZE) => {
                     if n == 0 {
+                        debug!("[{}] peer removed", self.label);
                         return;
                     }
                     for action in actions.drain(..) {
@@ -952,6 +991,7 @@ impl Tunnel {
             PeerActor {
                 our_key: self.our_key.clone(),
                 peer_key,
+                label: peer_label(&peer_key),
                 endpoint: None,
                 router: Arc::downgrade(&self.router),
                 socket: self.socket.clone(),
