@@ -25,7 +25,7 @@ func main() {
 	privateKeyBytes, _ := hex.DecodeString("67e112e97e07c8241a8f470a2dafb5d7b7eeceaaa8f58acbb009c884f85840c4")
 
 	publicKey, _ := curve25519.X25519(privateKeyBytes, curve25519.Basepoint)
-	fmt.Printf("public key %x", publicKey)
+	fmt.Printf("public key %x\n", publicKey)
 
 	err := dvc.IpcSet(`private_key=67e112e97e07c8241a8f470a2dafb5d7b7eeceaaa8f58acbb009c884f85840c4
 listen_port=51821
@@ -43,9 +43,16 @@ allowed_ip=0.0.0.0/0`)
 		case <-ctx.Done():
 			return
 		case buf := <-tun.Inbound:
-			fmt.Println("recv", string(buf))
-		case buf := <-tun.Outbound:
-			fmt.Println("send", string(buf))
+			fmt.Println("recv", len(buf), string(buf))
+			// echo IPv4 packets back with src/dst swapped; the IPv4 and
+			// UDP checksums are invariant under the swap
+			if len(buf) >= 20 && buf[0]>>4 == 4 {
+				echo := make([]byte, len(buf))
+				copy(echo, buf)
+				copy(echo[12:16], buf[16:20])
+				copy(echo[16:20], buf[12:16])
+				tun.Outbound <- echo
+			}
 		}
 	}
 }
