@@ -452,7 +452,7 @@ mod test {
             &cg_init,
             &mut init_msg,
         );
-        assert!(cv_init.verify_mac_1(&Tai64N::UNIX_EPOCH, &init_msg)); // TODO: set timestamp
+        assert!(cv_init.verify_mac_1(&init_msg));
         assert_eq!(init_msg[0], MessageType::HandshakeInit as u8);
         assert_eq!(init_msg[INIT_SENDER], INITIATOR.to_le_bytes());
 
@@ -467,7 +467,7 @@ mod test {
             &cg_resp,
             &mut resp_msg,
         );
-        assert!(cv_resp.verify_mac_1(&Tai64N::UNIX_EPOCH, &resp_msg)); // TODO: set timestamp
+        assert!(cv_resp.verify_mac_1(&resp_msg));
         assert_eq!(resp_msg[0], MessageType::HandshakeResp as u8);
         assert_eq!(
             resp_msg[RESP_RECEIVER],

@@ -1,9 +1,12 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::{self, IoSliceMut},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::{Arc, RwLock, Weak},
+    sync::{
+        Arc, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, SystemTime},
 };
@@ -15,7 +18,7 @@ use quinn_udp::{BATCH_SIZE, RecvMeta};
 pub use spacetun_protocol::{KeyParseError, PrivateKey, PublicKey};
 use spacetun_protocol::{
     MessageHeader, ReusableSecret, Tai64N,
-    cookies::{Generator, Verifier},
+    cookies::{COOKIE_REPLY_LENGTH, Generator, Verifier},
     handshake::{self, Handshake, INIT_MSG_LENGTH, InitReceived, InitSent},
     transport::{ReplayFilter, Transport},
 };
@@ -36,6 +39,10 @@ use socket::UdpSocket;
 const MAX_MESSAGE_SIZE: usize = 65535;
 const MAX_STAGED_PACKETS: usize = 128;
 const PEER_INBOUND_QUEUE: usize = 1024;
+
+// above this inbound-handshake rate we demand a cookie before spending CPU
+const MAX_HANDSHAKES_PER_SECOND: u32 = 25;
+const COOKIE_SECRET_ROTATION: Duration = Duration::from_secs(120);
 
 const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
@@ -69,6 +76,7 @@ pub struct PeerConfig {
 }
 
 impl PeerConfig {
+    /// A config for the peer with the given public key and no other options.
     pub fn new(public_key: PublicKey) -> Self {
         Self {
             public_key,
@@ -78,16 +86,19 @@ impl PeerConfig {
         }
     }
 
+    /// Sets the peer's initial endpoint.
     pub fn endpoint(mut self, endpoint: SocketAddr) -> Self {
         self.endpoint = Some(endpoint);
         self
     }
 
+    /// Sets the optional pre-shared key.
     pub fn preshared_key(mut self, preshared_key: [u8; 32]) -> Self {
         self.preshared_key = Some(preshared_key);
         self
     }
 
+    /// Sets the persistent keepalive interval.
     pub fn persistent_keepalive(mut self, interval: Duration) -> Self {
         self.persistent_keepalive = Some(interval);
         self
@@ -100,6 +111,7 @@ enum PeerAction {
     RecvData(Vec<u8>, u32, SocketAddr),
     RecvHandshakeInit(Handshake<InitReceived>, SocketAddr),
     RecvHandshakeResp(Vec<u8>, SocketAddr),
+    RecvCookieReply(Vec<u8>),
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +130,8 @@ pub struct PeerStatus {
 struct PendingHandshake {
     state: Handshake<InitSent>,
     our_index: u32,
+    // mac1 of the sent init; the AAD for decrypting a cookie reply to it
+    sent_mac1: [u8; 16],
     first_sent: Instant,
     last_sent: Instant,
 }
@@ -144,10 +158,8 @@ struct PeerActor {
     // weak so dropping the Tunnel terminates the peer actors
     router: Weak<RoutingTable>,
 
-    // TODO: implement cookies
+    // adds mac1/mac2 to our handshakes and consumes cookie replies from the peer
     cookie_generator: Generator,
-    #[allow(unused)]
-    cookie_verifier: Verifier,
 
     preshared_key: Option<[u8; 32]>,
     persistent_keepalive: Option<Duration>,
@@ -370,6 +382,25 @@ impl PeerActor {
                     ),
                 }
             }
+            PeerAction::RecvCookieReply(reply) => {
+                let Some(pending) = self.pending_handshake.as_ref() else {
+                    debug!("[{}] dropping unexpected cookie reply", self.label);
+                    return;
+                };
+                let sent_mac1 = pending.sent_mac1;
+                let first_sent = pending.first_sent;
+                match self
+                    .cookie_generator
+                    .process_cookie_reply(&reply, &sent_mac1, &Tai64N::now())
+                {
+                    // resend now so the retransmit carries a valid mac2
+                    Ok(()) => {
+                        debug!("[{}] cookie accepted; retransmitting handshake", self.label);
+                        self.start_handshake(Instant::now(), first_sent).await;
+                    }
+                    Err(e) => debug!("[{}] dropping invalid cookie reply: {:?}", self.label, e),
+                }
+            }
         }
     }
 
@@ -390,9 +421,13 @@ impl PeerActor {
             &self.cookie_generator,
             &mut msg,
         );
+        let mut sent_mac1 = [0u8; 16];
+        let mac1_offset = handshake::INIT_MSG_LENGTH - 32;
+        sent_mac1.copy_from_slice(&msg[mac1_offset..mac1_offset + 16]);
         if let Some(old) = self.pending_handshake.replace(PendingHandshake {
             state,
             our_index,
+            sent_mac1,
             first_sent,
             last_sent: now,
         }) {
@@ -620,7 +655,7 @@ impl PeerActor {
         }
     }
 
-    pub async fn run(mut self, mut rx: Receiver<PeerAction>) {
+    async fn run(mut self, mut rx: Receiver<PeerAction>) {
         debug!("[{}] peer added", self.label);
         let mut actions = Vec::with_capacity(BATCH_SIZE);
         let mut payloads = Vec::with_capacity(BATCH_SIZE);
@@ -806,6 +841,14 @@ impl RoutingTable {
         }
         false
     }
+
+    async fn recv_cookie_reply(&self, peer_index: u32, packet: Vec<u8>) -> bool {
+        if let Some(sender) = self.peer_index_sender(peer_index) {
+            let _ = sender.send(PeerAction::RecvCookieReply(packet)).await;
+            return true;
+        }
+        false
+    }
 }
 
 /// A handle to a registered peer: the owned receive half of its inbound
@@ -829,10 +872,12 @@ impl Drop for Peer {
 }
 
 impl Peer {
+    /// This peer's public key.
     pub fn public_key(&self) -> PublicKey {
         self.public_key
     }
 
+    /// Current status snapshot for this peer.
     pub fn status(&self) -> PeerStatus {
         self.status.read().unwrap().clone()
     }
@@ -843,6 +888,7 @@ impl Peer {
         self.data_rx.recv().await
     }
 
+    /// Sends a payload to this peer, staging it if no session is established yet.
     pub async fn send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
         let router = self.router.upgrade().ok_or(SendError::Closed)?;
         router.send_data(&self.public_key, payload.into()).await
@@ -865,6 +911,47 @@ impl Peer {
             .map(|_| ())
             .map_err(|_| SendError::Closed)
     }
+
+    /// Returns a cloneable send handle. Unlike the `Peer`, it does not own the
+    /// registration: dropping every sender does not remove the peer.
+    pub fn sender(&self) -> PeerSender {
+        PeerSender {
+            public_key: self.public_key,
+            router: self.router.clone(),
+        }
+    }
+}
+
+/// A cloneable handle for sending to a peer, decoupled from its inbound
+/// queue so many callers can share the send path.
+#[derive(Clone)]
+pub struct PeerSender {
+    public_key: PublicKey,
+    router: Weak<RoutingTable>,
+}
+
+impl PeerSender {
+    /// The peer's public key.
+    pub fn public_key(&self) -> PublicKey {
+        self.public_key
+    }
+
+    /// Sends a payload to the peer, staging it if no session is established yet.
+    pub async fn send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
+        let router = self.router.upgrade().ok_or(SendError::Closed)?;
+        router.send_data(&self.public_key, payload.into()).await
+    }
+
+    /// Updates the peer's endpoint and initiates a handshake if none is pending.
+    pub async fn connect(&self, endpoint: SocketAddr) -> Result<(), SendError> {
+        let router = self.router.upgrade().ok_or(SendError::Closed)?;
+        router.connect(&self.public_key, endpoint).await
+    }
+
+    /// Current status snapshot, or `None` if the peer is no longer registered.
+    pub fn status(&self) -> Option<PeerStatus> {
+        self.router.upgrade()?.peer_status(&self.public_key)
+    }
 }
 
 impl futures_core::Stream for Peer {
@@ -875,10 +962,86 @@ impl futures_core::Stream for Peer {
     }
 }
 
+enum HandshakeDecision {
+    Process,
+    Drop,
+    Cookie([u8; COOKIE_REPLY_LENGTH]),
+}
+
+// Responder-side DoS mitigation, owned by the single read loop: cheap mac1
+// rejection always, and a cookie challenge (mac2) once the inbound handshake
+// rate crosses a threshold.
+struct LoadGuard {
+    verifier: Verifier,
+    secret: [u8; 32],
+    secret_rotated: Instant,
+    window_start: Instant,
+    handshakes: u32,
+    force: Arc<AtomicBool>,
+}
+
+impl LoadGuard {
+    fn new(our_public: PublicKey, force: Arc<AtomicBool>) -> Self {
+        let now = Instant::now();
+        Self {
+            verifier: Verifier::new(our_public),
+            secret: rand::random(),
+            secret_rotated: now,
+            window_start: now,
+            handshakes: 0,
+            force,
+        }
+    }
+
+    fn check(&mut self, msg: &[u8], source: SocketAddr) -> HandshakeDecision {
+        if msg.len() < 32 || !self.verifier.verify_mac_1(msg) {
+            return HandshakeDecision::Drop;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.secret_rotated) >= COOKIE_SECRET_ROTATION {
+            self.secret = rand::random();
+            self.secret_rotated = now;
+        }
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.handshakes = 0;
+        }
+        self.handshakes += 1;
+
+        let under_load =
+            self.force.load(Ordering::Relaxed) || self.handshakes > MAX_HANDSHAKES_PER_SECOND;
+        if !under_load {
+            return HandshakeDecision::Process;
+        }
+        let source = source_bytes(source);
+        if self.verifier.verify_mac_2(msg, &source, &self.secret) {
+            return HandshakeDecision::Process;
+        }
+        let mut reply = [0u8; COOKIE_REPLY_LENGTH];
+        self.verifier
+            .write_cookie_reply(msg, &source, &self.secret, rand::random(), &mut reply);
+        HandshakeDecision::Cookie(reply)
+    }
+}
+
+fn source_bytes(addr: SocketAddr) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(18);
+    match addr.ip() {
+        IpAddr::V4(ip) => bytes.extend_from_slice(&ip.octets()),
+        IpAddr::V6(ip) => bytes.extend_from_slice(&ip.octets()),
+    }
+    bytes.extend_from_slice(&addr.port().to_be_bytes());
+    bytes
+}
+
 pub struct Tunnel {
     our_key: PrivateKey,
     socket: Arc<UdpSocket>,
     router: Arc<RoutingTable>,
+    // only the read loop's clone is read in production; the tunnel keeps a
+    // handle solely so tests can force the under-load path
+    #[cfg(test)]
+    under_load: Arc<AtomicBool>,
     read_task: JoinHandle<()>,
 }
 
@@ -889,7 +1052,13 @@ impl Drop for Tunnel {
 }
 
 impl Tunnel {
-    async fn read_loop(our_private: PrivateKey, socket: Arc<UdpSocket>, router: Arc<RoutingTable>) {
+    async fn read_loop(
+        our_private: PrivateKey,
+        socket: Arc<UdpSocket>,
+        router: Arc<RoutingTable>,
+        under_load: Arc<AtomicBool>,
+    ) {
+        let mut guard = LoadGuard::new(our_private.public_key(), under_load);
         let mut bufs = vec![vec![0u8; MAX_MESSAGE_SIZE]; BATCH_SIZE];
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
         loop {
@@ -918,6 +1087,22 @@ impl Tunnel {
                             continue;
                         }
                     };
+                    if matches!(
+                        header,
+                        MessageHeader::HandshakeInit | MessageHeader::HandshakeResponse { .. }
+                    ) {
+                        match guard.check(segment, meta.addr) {
+                            HandshakeDecision::Process => {}
+                            HandshakeDecision::Drop => {
+                                debug!("dropping handshake from {} (mac1)", meta.addr);
+                                continue;
+                            }
+                            HandshakeDecision::Cookie(reply) => {
+                                let _ = socket.send(meta.addr, &reply).await;
+                                continue;
+                            }
+                        }
+                    }
                     match header {
                         MessageHeader::HandshakeInit => {
                             match Handshake::receive(our_private.clone(), segment) {
@@ -942,8 +1127,8 @@ impl Tunnel {
                                 .recv_data(meta.addr, receiver, segment.to_vec())
                                 .await;
                         }
-                        MessageHeader::CookieReply { receiver: _ } => {
-                            unimplemented!()
+                        MessageHeader::CookieReply { receiver } => {
+                            let _ = router.recv_cookie_reply(receiver, segment.to_vec()).await;
                         }
                     };
                 }
@@ -968,7 +1153,6 @@ impl Tunnel {
                 router: Arc::downgrade(&self.router),
                 socket: self.socket.clone(),
                 cookie_generator: Generator::new(peer_key),
-                cookie_verifier: Verifier::new(peer_key),
                 preshared_key: config.preshared_key,
                 persistent_keepalive: config.persistent_keepalive,
                 status: status.clone(),
@@ -991,6 +1175,8 @@ impl Tunnel {
         })
     }
 
+    /// Registers a peer and returns its handle, initiating a handshake if the
+    /// config carries an endpoint. Errors if the peer is already registered.
     pub async fn add_peer(&self, config: PeerConfig) -> Result<Peer, RegisterError> {
         let peer = self.register_peer(&config)?;
         if let Some(endpoint) = config.endpoint {
@@ -999,10 +1185,13 @@ impl Tunnel {
         Ok(peer)
     }
 
+    /// Registers a peer with no endpoint; it can only respond to inbound
+    /// handshakes until [`Peer::connect`] gives it one.
     pub fn allow_peer(&self, peer_key: PublicKey) -> Result<Peer, RegisterError> {
         self.register_peer(&PeerConfig::new(peer_key))
     }
 
+    /// Registers a peer with an endpoint and initiates a handshake.
     pub async fn connect_peer(
         &self,
         peer_key: PublicKey,
@@ -1012,32 +1201,45 @@ impl Tunnel {
             .await
     }
 
+    /// The local UDP address the tunnel is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
 
+    /// Status snapshots for every registered peer.
     pub fn peers(&self) -> Vec<PeerStatus> {
         self.router.peer_statuses()
     }
 
+    /// Status snapshot for one peer, or `None` if it isn't registered.
     pub fn peer(&self, peer: &PublicKey) -> Option<PeerStatus> {
         self.router.peer_status(peer)
     }
 
+    /// Binds the UDP socket and starts the tunnel's receive loop.
     pub async fn new(addr: SocketAddr, our_key: PrivateKey) -> io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         let router = Arc::new(RoutingTable::new());
+        let under_load = Arc::new(AtomicBool::new(false));
         let read_task = spawn(Self::read_loop(
             our_key.clone(),
             socket.clone(),
             router.clone(),
+            under_load.clone(),
         ));
         Ok(Self {
             our_key,
             socket,
             router,
+            #[cfg(test)]
+            under_load,
             read_task,
         })
+    }
+
+    #[cfg(test)]
+    fn force_under_load(&self) {
+        self.under_load.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1052,6 +1254,38 @@ mod tests {
 
     fn loopback() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    }
+
+    // The responder is forced under load, so the initiator's first handshake is
+    // answered with a cookie challenge; it must decrypt the cookie, retransmit
+    // with a valid mac2, and complete — exercising both cookie directions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cookie_under_load() {
+        let sk_a = PrivateKey::random();
+        let pk_a = sk_a.public_key();
+        let sk_b = PrivateKey::random();
+        let pk_b = sk_b.public_key();
+
+        let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
+        let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
+        let addr_b = tunnel_b.local_addr().unwrap();
+        tunnel_b.force_under_load();
+
+        let mut peer_a = tunnel_b.allow_peer(pk_a).unwrap();
+        let peer_b = tunnel_a.connect_peer(pk_b, addr_b).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), peer_b.ready())
+            .await
+            .expect("handshake did not complete through the cookie challenge")
+            .unwrap();
+
+        let payload = b"through the cookie".to_vec();
+        peer_b.send(payload.clone()).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), peer_a.recv())
+            .await
+            .expect("payload not delivered")
+            .unwrap();
+        assert_eq!(got, payload);
     }
 
     #[tokio::test(flavor = "multi_thread")]

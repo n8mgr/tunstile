@@ -145,7 +145,9 @@ pub(crate) fn xaead_open(
 
 /// Computes a 16 byte MAC using the Blake2s256 in keyed mode.
 pub(crate) fn mac(key: &[u8], input: &[&[u8]]) -> [u8; 16] {
-    let mut h = <Blake2sMac<_> as Mac>::new(key.into());
+    // Blake2s keyed MAC takes a variable-length key (mac1 uses a 32-byte hash,
+    // mac2 uses the 16-byte cookie), so the key can't be a fixed-size array.
+    let mut h = <Blake2sMac<_> as Mac>::new_from_slice(key).expect("mac key must be <= 32 bytes");
     for input in input {
         h.update(input);
     }

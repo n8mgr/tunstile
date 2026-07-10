@@ -40,6 +40,7 @@ fn fmt_key_base64(key: &[u8; 32], f: &mut fmt::Formatter<'_>) -> fmt::Result {
 pub struct PublicKey(pub(crate) XPublicKey);
 
 impl PublicKey {
+    /// The raw 32-byte key.
     pub fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
     }
@@ -83,15 +84,18 @@ impl fmt::Debug for PublicKey {
 pub struct PrivateKey(pub(crate) StaticSecret);
 
 impl PrivateKey {
+    /// Generates a new random private key.
     #[cfg(any(test, feature = "std"))]
     pub fn random() -> Self {
         Self(StaticSecret::random())
     }
 
+    /// The corresponding public key.
     pub fn public_key(&self) -> PublicKey {
         PublicKey::from(self)
     }
 
+    /// The raw 32-byte key.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
     }

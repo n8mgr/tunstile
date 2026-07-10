@@ -105,6 +105,7 @@ impl Transport {
         }
     }
 
+    /// Our receiver index for this session, as the peer addresses it.
     pub fn our_index(&self) -> u32 {
         self.our_index
     }
