@@ -1,3 +1,5 @@
+//! Transport data messages: per-session AEAD and replay protection.
+
 use core::{
     ops::Range,
     sync::atomic::{AtomicU64, Ordering},
@@ -22,10 +24,17 @@ const COUNTER_WINDOW: u64 = (COUNTER_BLOCKS as u64 - 1) * COUNTER_BLOCK_BITS;
 /// Reject-After-Messages from the WireGuard spec: 2^64 − 2^13 − 1.
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
 
-#[derive(Debug, Error)]
+/// Error encrypting or decrypting a transport data message.
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransportError {
     #[error("invalid packet")]
     InvalidPacket,
+
+    #[error("buffer too small: need {required} bytes")]
+    BufferTooSmall { required: usize },
+
+    #[error("send counter exhausted")]
+    CounterExhausted,
 }
 
 /// Sliding-window duplicate detection for received counters (RFC 6479).
@@ -44,6 +53,7 @@ impl Default for ReplayFilter {
 }
 
 impl ReplayFilter {
+    /// Creates an empty filter.
     pub const fn new() -> Self {
         Self {
             last: 0,
@@ -78,6 +88,8 @@ impl ReplayFilter {
     }
 }
 
+/// The keys for one established session: encrypts outbound and decrypts
+/// inbound transport data messages.
 pub struct Transport {
     our_index: u32,
     peer_index: u32,
@@ -111,11 +123,18 @@ impl Transport {
     }
 
     /// Writes an encrypted transport data message to the given buffer.
-    pub fn send(&self, payload: &[u8], buf: &mut [u8]) {
-        if buf.len() != Self::packet_len(payload.len()) {
-            panic!("buffer size mismatch");
+    pub fn send(&self, payload: &[u8], buf: &mut [u8]) -> Result<usize, TransportError> {
+        let len = Self::packet_len(payload.len());
+        if buf.len() < len {
+            return Err(TransportError::BufferTooSmall { required: len });
         }
-        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+        let buf = &mut buf[..len];
+        let counter = self
+            .send_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |counter| {
+                (counter < REJECT_AFTER_MESSAGES).then_some(counter + 1)
+            })
+            .map_err(|_| TransportError::CounterExhausted)?;
         buf[0] = MessageType::Data as u8;
         buf[1..4].fill(0);
         buf[DATA_RECEIVER].copy_from_slice(&self.peer_index.to_le_bytes());
@@ -127,8 +146,10 @@ impl Transport {
             &[],
             &mut buf[DATA_PAYLOAD_OFFSET..],
         );
+        Ok(len)
     }
 
+    /// The wire length of a data message carrying `payload_size` bytes.
     pub const fn packet_len(payload_size: usize) -> usize {
         DATA_PAYLOAD_OFFSET + payload_size + AEAD_TAG_SIZE
     }
@@ -139,6 +160,7 @@ impl Transport {
     pub fn receive<'a>(&self, packet: &'a mut [u8]) -> Result<(u64, &'a [u8]), TransportError> {
         if packet.len() < Self::packet_len(0)
             || MessageType::try_from(packet[0]) != Ok(MessageType::Data)
+            || packet[1..4] != [0; 3]
         {
             return Err(TransportError::InvalidPacket);
         }
@@ -168,7 +190,14 @@ impl Transport {
 
 #[cfg(test)]
 mod test {
+    use crate::crypto::{Hash256, init_aead};
+
     use super::*;
+
+    fn transport() -> Transport {
+        let key = Hash256::default();
+        Transport::new(1, 2, init_aead(&key), init_aead(&key))
+    }
 
     #[test]
     fn replay_filter() {
@@ -205,5 +234,37 @@ mod test {
         assert!(!filter.validate(REJECT_AFTER_MESSAGES));
         assert!(!filter.validate(u64::MAX));
         assert!(filter.validate(REJECT_AFTER_MESSAGES - 1));
+    }
+
+    #[test]
+    fn send_is_fallible_and_uses_only_the_required_prefix() {
+        let transport = transport();
+        let required = Transport::packet_len(3);
+        let mut short = [0u8; Transport::packet_len(3) - 1];
+        assert_eq!(
+            transport.send(b"abc", &mut short),
+            Err(TransportError::BufferTooSmall { required })
+        );
+
+        let mut large = [0xaau8; Transport::packet_len(3) + 4];
+        assert_eq!(transport.send(b"abc", &mut large), Ok(required));
+        assert_eq!(&large[required..], &[0xaa; 4]);
+    }
+
+    #[test]
+    fn send_counter_does_not_wrap() {
+        let transport = transport();
+        transport
+            .send_counter
+            .store(REJECT_AFTER_MESSAGES, Ordering::Relaxed);
+        let mut packet = [0u8; Transport::packet_len(0)];
+        assert_eq!(
+            transport.send(&[], &mut packet),
+            Err(TransportError::CounterExhausted)
+        );
+        assert_eq!(
+            transport.send_counter.load(Ordering::Relaxed),
+            REJECT_AFTER_MESSAGES
+        );
     }
 }

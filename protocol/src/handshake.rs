@@ -1,9 +1,12 @@
+//! The Noise IKpsk2 handshake, from initiation through transport-key
+//! derivation.
+
 use core::ops::Range;
 
 use ring::aead::{CHACHA20_POLY1305, LessSafeKey, UnboundKey};
 use tai64::Tai64N;
 use thiserror::Error;
-use x25519_dalek::{PublicKey as XPublicKey, ReusableSecret, StaticSecret};
+use x25519_dalek::{PublicKey as XPublicKey, ReusableSecret, SharedSecret, StaticSecret};
 
 use crate::keys::{PrivateKey, PublicKey};
 use zeroize::ZeroizeOnDrop;
@@ -37,6 +40,7 @@ const INIT_MAC1: Range<usize> =
     INIT_ENCRYPTED_TIMESTAMP.end..INIT_ENCRYPTED_TIMESTAMP.end + MAC_SIZE;
 const INIT_MAC2: Range<usize> = INIT_MAC1.end..INIT_MAC1.end + MAC_SIZE;
 
+/// Wire length of a handshake initiation message.
 pub const INIT_MSG_LENGTH: usize = INIT_MAC2.end;
 
 // handshake resp wire layout: [type(1) | reserved(3) | sender(4) | receiver(4) | ephemeral(32) | empty_tag(16) | mac1(16) | mac2(16)]
@@ -49,14 +53,27 @@ const RESP_MAC1: Range<usize> =
     RESP_ENCRYPTED_EMPTY_TAG.end..RESP_ENCRYPTED_EMPTY_TAG.end + MAC_SIZE;
 const RESP_MAC2: Range<usize> = RESP_MAC1.end..RESP_MAC1.end + MAC_SIZE;
 
+/// Wire length of a handshake response message.
 pub const RESP_MSG_LENGTH: usize = RESP_MAC2.end;
 
-#[derive(Debug, Error)]
+/// Error creating or processing a handshake message.
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum HandshakeError {
     #[error("failed")]
     Failed,
+
+    #[error("buffer too small: need {required} bytes")]
+    BufferTooSmall { required: usize },
 }
 
+fn contributory(secret: SharedSecret) -> Result<SharedSecret, HandshakeError> {
+    secret
+        .was_contributory()
+        .then_some(secret)
+        .ok_or(HandshakeError::Failed)
+}
+
+/// A WireGuard (Noise IKpsk2) handshake, parameterized by its current state.
 #[derive(Clone)]
 pub struct Handshake<S> {
     our_private: StaticSecret,
@@ -66,7 +83,7 @@ pub struct Handshake<S> {
     state: S,
 }
 
-// initiator state
+/// Initiator state: an initiation was sent; awaiting the peer's response.
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct InitSent {
     index_initiator: u32,
@@ -76,16 +93,19 @@ pub struct InitSent {
     h: Hash256,
 }
 
-// responder state
+/// Responder state: a valid initiation was received and can be responded to.
 #[derive(ZeroizeOnDrop)]
 pub struct InitReceived {
     ephemeral_public_initiator: XPublicKey,
     index_initiator: u32,
+    #[zeroize(skip)]
+    timestamp: Tai64N,
 
     constr: Hash256,
     h: Hash256,
 }
 
+/// Responder state: the response was sent; transport keys can be derived.
 #[derive(ZeroizeOnDrop)]
 pub struct ReceiverEstablished {
     our_index: u32,
@@ -93,6 +113,8 @@ pub struct ReceiverEstablished {
     constr: Hash256,
 }
 
+/// Initiator state: a valid response was received; transport keys can be
+/// derived.
 #[derive(ZeroizeOnDrop)]
 pub struct InitiatorEstablished {
     our_index: u32,
@@ -101,19 +123,22 @@ pub struct InitiatorEstablished {
 }
 
 impl Handshake<InitReceived> {
-    /// Returns the peer's public key. It
-    /// is parsed from the handshake initiation.
+    /// The peer's public key, parsed from the initiation.
     pub fn peer_key(&self) -> PublicKey {
         PublicKey(self.peer_public)
     }
 
-    /// Parses a received handshake initiator message
-    ///
-    /// Returns an error if the packet is not a valid handshake initiator message.
+    /// The authenticated timestamp carried by the initiation.
+    pub fn timestamp(&self) -> Tai64N {
+        self.state.timestamp
+    }
+
+    /// Parses and validates a received handshake initiation.
     pub fn receive(our_private: PrivateKey, packet: &mut [u8]) -> Result<Self, HandshakeError> {
         let our_private = our_private.0;
-        if packet.len() < INIT_MSG_LENGTH
+        if packet.len() != INIT_MSG_LENGTH
             || MessageType::try_from(packet[0]) != Ok(MessageType::HandshakeInit)
+            || packet[1..4] != [0; 3]
         {
             return Err(HandshakeError::Failed);
         }
@@ -132,12 +157,11 @@ impl Handshake<InitReceived> {
         let h = hash(&[INITIAL_IDENTIFIER_HASH, our_public.as_ref()]);
         let [constr] = kdf::<1>(constr, ephemeral_public_key.as_ref());
         let h = hash(&[h.as_ref(), ephemeral_public_key.as_ref()]);
-        let shared_secret = our_private.diffie_hellman(&ephemeral_public_key);
+        let shared_secret = contributory(our_private.diffie_hellman(&ephemeral_public_key))?;
         let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
 
         let static_pk_buf = &mut packet[INIT_ENCRYPTED_STATIC_PK];
         let h_temp = hash(&[h.as_ref(), static_pk_buf]); // hash is computed based on the encrypted bytes
-        // decrypt in place and verify the static public key matches the peer
         aead_open(&init_aead(&key), 0, h.as_ref(), static_pk_buf)
             .map_err(|_| HandshakeError::Failed)?;
 
@@ -146,13 +170,16 @@ impl Handshake<InitReceived> {
         let peer_public = XPublicKey::from(peer_public);
         let h = h_temp;
 
-        let shared_secret = our_private.diffie_hellman(&peer_public);
+        let shared_secret = contributory(our_private.diffie_hellman(&peer_public))?;
         let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
 
         let timestamp_buf = &mut packet[INIT_ENCRYPTED_TIMESTAMP];
         let h_temp = hash(&[h.as_ref(), timestamp_buf]); // hash is computed based on the encrypted bytes
-        aead_open(&init_aead(&key), 0, h.as_ref(), timestamp_buf)
-            .map_err(|_| HandshakeError::Failed)?;
+        let timestamp = Tai64N::from_slice(
+            aead_open(&init_aead(&key), 0, h.as_ref(), timestamp_buf)
+                .map_err(|_| HandshakeError::Failed)?,
+        )
+        .map_err(|_| HandshakeError::Failed)?;
         let h = h_temp;
 
         Ok(Handshake {
@@ -162,6 +189,7 @@ impl Handshake<InitReceived> {
             state: InitReceived {
                 ephemeral_public_initiator: ephemeral_public_key,
                 index_initiator: sender,
+                timestamp,
 
                 constr,
                 h,
@@ -169,27 +197,23 @@ impl Handshake<InitReceived> {
         })
     }
 
-    /// Responds to a received handshake initiator message
-    ///
-    /// # Arguments
-    /// * `index` - The index of the handshake.
-    /// * `ephemeral_secret` - The ephemeral secret to use for the handshake.
-    /// * `preshared_key` - The preshared key to use for the handshake.
-    /// * `timestamp` - The timestamp to use for the handshake.
-    /// * `cookies` - The cookie generator to use for the handshake.
-    /// * `buf` - The buffer to write the handshake packet to. It must be exactly [`RESP_MSG_LENGTH`] bytes.
+    /// Responds to the received initiation, writing the response message to
+    /// the first [`RESP_MSG_LENGTH`] bytes of `buf`.
     pub fn respond(
         self,
         index: u32,
         ephemeral_secret: ReusableSecret,
         preshared_key: Option<[u8; 32]>,
         timestamp: Tai64N,
-        cookies: &Generator,
+        cookies: &mut Generator,
         buf: &mut [u8],
-    ) -> Handshake<ReceiverEstablished> {
-        if buf.len() != RESP_MSG_LENGTH {
-            panic!("buf must be at least RESP_MSG_LENGTH bytes");
+    ) -> Result<Handshake<ReceiverEstablished>, HandshakeError> {
+        if buf.len() < RESP_MSG_LENGTH {
+            return Err(HandshakeError::BufferTooSmall {
+                required: RESP_MSG_LENGTH,
+            });
         }
+        let buf = &mut buf[..RESP_MSG_LENGTH];
         buf[0] = MessageType::HandshakeResp as u8;
         buf[1..4].fill(0);
         buf[RESP_SENDER].copy_from_slice(&index.to_le_bytes());
@@ -215,10 +239,11 @@ impl Handshake<InitReceived> {
             h.as_ref(),
             &mut buf[RESP_ENCRYPTED_EMPTY_TAG],
         );
-        cookies.add_macs(&timestamp, buf);
-        // unused? let h = hash(&[h.as_ref(), &encrypted_empty_tag]);
+        cookies
+            .add_macs(&timestamp, buf)
+            .map_err(|_| HandshakeError::Failed)?;
 
-        Handshake {
+        Ok(Handshake {
             our_private: self.our_private,
             our_public: self.our_public,
             peer_public: self.peer_public,
@@ -227,35 +252,28 @@ impl Handshake<InitReceived> {
                 our_index: index,
                 peer_index: self.state.index_initiator,
             },
-        }
+        })
     }
 }
 
 impl Handshake<InitSent> {
-    /// Initiates a handshake with the peer.
-    /// The handshake packet is written to the provided buffer.
-    ///
-    /// # Arguments
-    /// * `sender` - The index of the handshake.
-    /// * `ephemeral_secret` - The ephemeral secret to use for the handshake.
-    /// * `timestamp` - The timestamp to use for the handshake.
-    /// * `cookies` - The cookie generator to use for the handshake.
-    /// * `buf` - The buffer to write the handshake packet to. It must be exactly [`INIT_MSG_LENGTH`] bytes.
-    ///
-    /// # Returns
-    /// A `Handshake<InitSent>` instance.
+    /// Initiates a handshake with the peer, writing the initiation message to
+    /// the first [`INIT_MSG_LENGTH`] bytes of `buf`.
     pub fn initiate(
         our_private: PrivateKey,
         peer_public: PublicKey,
         sender: u32,
         ephemeral_secret: ReusableSecret,
         timestamp: Tai64N,
-        cookies: &Generator,
+        cookies: &mut Generator,
         buf: &mut [u8],
-    ) -> Self {
-        if buf.len() != INIT_MSG_LENGTH {
-            panic!("buf must be at least INIT_MSG_LENGTH bytes");
+    ) -> Result<Self, HandshakeError> {
+        if buf.len() < INIT_MSG_LENGTH {
+            return Err(HandshakeError::BufferTooSmall {
+                required: INIT_MSG_LENGTH,
+            });
         }
+        let buf = &mut buf[..INIT_MSG_LENGTH];
         let our_private = our_private.0;
         let peer_public = peer_public.0;
         buf[0] = MessageType::HandshakeInit as u8;
@@ -269,7 +287,7 @@ impl Handshake<InitSent> {
 
         let [constr] = kdf::<1>(constr, ephemeral_public_key.as_ref());
         let h = hash(&[h.as_ref(), ephemeral_public_key.as_ref()]);
-        let shared_secret = ephemeral_secret.diffie_hellman(&peer_public);
+        let shared_secret = contributory(ephemeral_secret.diffie_hellman(&peer_public))?;
         let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
         let aead = LessSafeKey::new(
             UnboundKey::new(&CHACHA20_POLY1305, key.as_ref())
@@ -295,9 +313,11 @@ impl Handshake<InitSent> {
         aead_seal(&aead, 0, h.as_ref(), &mut buf[INIT_ENCRYPTED_TIMESTAMP]);
 
         let h = hash(&[h.as_ref(), &buf[INIT_ENCRYPTED_TIMESTAMP]]);
-        cookies.add_macs(&timestamp, buf);
+        cookies
+            .add_macs(&timestamp, buf)
+            .map_err(|_| HandshakeError::Failed)?;
 
-        Handshake {
+        Ok(Handshake {
             our_private,
             our_public,
             peer_public,
@@ -308,17 +328,11 @@ impl Handshake<InitSent> {
                 index_initiator: sender,
                 ephemeral_secret_initiator: ephemeral_secret,
             },
-        }
+        })
     }
 
-    /// Handles a received handshake response message
-    ///
-    /// # Arguments
-    /// * `preshared_key` - The optional preshared key to use for the handshake.
-    /// * `packet` - The buffer containing the handshake packet.
-    ///
-    /// # Returns
-    /// An error if the handshake failed, otherwise a [`Handshake<InitiatorEstablished>`].
+    /// Consumes a received handshake response to our initiation, yielding the
+    /// established initiator handshake.
     pub fn response_received(
         self,
         preshared_key: Option<[u8; 32]>,
@@ -326,6 +340,7 @@ impl Handshake<InitSent> {
     ) -> Result<Handshake<InitiatorEstablished>, HandshakeError> {
         if packet.len() != RESP_MSG_LENGTH
             || MessageType::try_from(packet[0]) != Ok(MessageType::HandshakeResp)
+            || packet[1..4] != [0; 3]
         {
             return Err(HandshakeError::Failed);
         }
@@ -350,10 +365,11 @@ impl Handshake<InitSent> {
         let [constr] = kdf::<1>(self.state.constr.as_ref(), ephemeral_public_key.as_ref());
         let h = hash(&[self.state.h.as_ref(), ephemeral_public_key.as_ref()]);
 
-        let shared_secret = self
-            .state
-            .ephemeral_secret_initiator
-            .diffie_hellman(&ephemeral_public_key);
+        let shared_secret = contributory(
+            self.state
+                .ephemeral_secret_initiator
+                .diffie_hellman(&ephemeral_public_key),
+        )?;
         let [constr] = kdf::<1>(constr.as_ref(), shared_secret.as_ref());
 
         let shared_secret = self.our_private.diffie_hellman(&ephemeral_public_key);
@@ -437,9 +453,9 @@ mod test {
         let hs_resp = ReusableSecret::random();
 
         // macs are computed using the other party's public key
-        let cg_init = Generator::new(pk2.clone());
+        let mut cg_init = Generator::new(pk2.clone());
         let cv_init = Verifier::new(pk2.clone());
-        let cg_resp = Generator::new(pk1.clone());
+        let mut cg_resp = Generator::new(pk1.clone());
         let cv_resp = Verifier::new(pk1.clone());
 
         let mut init_msg = [0u8; INIT_MSG_LENGTH];
@@ -449,9 +465,10 @@ mod test {
             INITIATOR,
             hs_init,
             Tai64N::UNIX_EPOCH,
-            &cg_init,
+            &mut cg_init,
             &mut init_msg,
-        );
+        )
+        .unwrap();
         assert!(cv_init.verify_mac_1(&init_msg));
         assert_eq!(init_msg[0], MessageType::HandshakeInit as u8);
         assert_eq!(init_msg[INIT_SENDER], INITIATOR.to_le_bytes());
@@ -459,14 +476,17 @@ mod test {
         let mut resp_msg = [0u8; RESP_MSG_LENGTH];
         let h_resp = Handshake::receive(sk2, &mut init_msg).expect("receive init failed");
         assert_eq!(h_resp.peer_key(), pk1);
-        let h_resp = h_resp.respond(
-            RECEIVER,
-            hs_resp,
-            None,
-            Tai64N::UNIX_EPOCH,
-            &cg_resp,
-            &mut resp_msg,
-        );
+        assert_eq!(h_resp.timestamp(), Tai64N::UNIX_EPOCH);
+        let h_resp = h_resp
+            .respond(
+                RECEIVER,
+                hs_resp,
+                None,
+                Tai64N::UNIX_EPOCH,
+                &mut cg_resp,
+                &mut resp_msg,
+            )
+            .unwrap();
         assert!(cv_resp.verify_mac_1(&resp_msg));
         assert_eq!(resp_msg[0], MessageType::HandshakeResp as u8);
         assert_eq!(
@@ -491,7 +511,7 @@ mod test {
         const INITIATOR_DATA: &[u8] = b"Hello, World!";
 
         let mut init_msg = vec![0u8; Transport::packet_len(INITIATOR_DATA.len())];
-        t_init.send(INITIATOR_DATA, &mut init_msg);
+        t_init.send(INITIATOR_DATA, &mut init_msg).unwrap();
         assert_eq!(init_msg[0], MessageType::Data as u8);
         assert_eq!(init_msg[transport::DATA_RECEIVER], RECEIVER.to_le_bytes());
         assert_eq!(init_msg[transport::DATA_COUNTER], 0u64.to_le_bytes());
@@ -501,7 +521,7 @@ mod test {
 
         const RECEIVER_DATA: &[u8] = b"Goodbye, World!";
         let mut recv_msg = vec![0u8; Transport::packet_len(RECEIVER_DATA.len())];
-        t_resp.send(RECEIVER_DATA, &mut recv_msg);
+        t_resp.send(RECEIVER_DATA, &mut recv_msg).unwrap();
         assert_eq!(recv_msg[0], MessageType::Data as u8);
         assert_eq!(recv_msg[transport::DATA_RECEIVER], INITIATOR.to_le_bytes());
         assert_eq!(recv_msg[transport::DATA_COUNTER], 0u64.to_le_bytes());
@@ -527,5 +547,47 @@ mod test {
             INITIAL_IDENTIFIER_HASH,
             "identifier hash mismatch"
         );
+    }
+
+    #[test]
+    fn initiate_rejects_a_non_contributory_peer_key() {
+        let our_key = PrivateKey::random();
+        let peer_key = PublicKey::from([0u8; 32]);
+        let mut cookies = Generator::new(peer_key);
+        let mut packet = [0u8; INIT_MSG_LENGTH];
+
+        assert!(matches!(
+            Handshake::initiate(
+                our_key,
+                peer_key,
+                1,
+                ReusableSecret::random(),
+                Tai64N::UNIX_EPOCH,
+                &mut cookies,
+                &mut packet,
+            ),
+            Err(HandshakeError::Failed)
+        ));
+    }
+
+    #[test]
+    fn initiate_accepts_a_larger_output_buffer() {
+        let our_key = PrivateKey::random();
+        let peer_key = PrivateKey::random().public_key();
+        let mut cookies = Generator::new(peer_key);
+        let mut packet = [0xaau8; INIT_MSG_LENGTH + 8];
+
+        Handshake::initiate(
+            our_key,
+            peer_key,
+            1,
+            ReusableSecret::random(),
+            Tai64N::UNIX_EPOCH,
+            &mut cookies,
+            &mut packet,
+        )
+        .unwrap();
+
+        assert_eq!(&packet[INIT_MSG_LENGTH..], &[0xaa; 8]);
     }
 }

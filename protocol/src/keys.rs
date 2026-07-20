@@ -6,6 +6,7 @@ use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 const KEY_BASE64_LEN: usize = 44;
 
+/// Error parsing a base64-encoded key.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum KeyParseError {
     #[error("invalid base64")]
@@ -125,5 +126,40 @@ impl FromStr for PrivateKey {
 impl fmt::Debug for PrivateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PrivateKey(…)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use alloc::{format, string::ToString};
+
+    use super::*;
+
+    #[test]
+    fn key_base64_roundtrip() {
+        let secret = PrivateKey::random();
+        let public = secret.public_key();
+        let encoded = public.to_string();
+        assert_eq!(encoded.len(), 44);
+        assert_eq!(encoded.parse::<PublicKey>().unwrap(), public);
+        assert_eq!(
+            BASE64_STANDARD
+                .encode(secret.to_bytes())
+                .parse::<PrivateKey>()
+                .unwrap()
+                .public_key(),
+            public
+        );
+        assert_eq!(format!("{secret:?}"), "PrivateKey(…)");
+
+        assert_eq!(
+            "!".repeat(44).parse::<PublicKey>().err(),
+            Some(KeyParseError::InvalidEncoding)
+        );
+        assert_eq!(
+            BASE64_STANDARD.encode([0u8; 16]).parse::<PublicKey>().err(),
+            Some(KeyParseError::InvalidLength)
+        );
     }
 }

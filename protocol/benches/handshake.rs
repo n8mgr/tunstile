@@ -13,8 +13,8 @@ fn bench_handshake(c: &mut Criterion) {
     let sk2 = PrivateKey::from(rand::random::<[u8; 32]>());
     let pk2 = sk2.public_key();
 
-    let c_init = Generator::new(pk2);
-    let c_resp = Generator::new(pk1);
+    let mut c_init = Generator::new(pk2);
+    let mut c_resp = Generator::new(pk1);
 
     c.bench_function("handshake_e2e", |b| {
         b.iter_batched(
@@ -27,9 +27,10 @@ fn bench_handshake(c: &mut Criterion) {
                     100,
                     hs_init,
                     Tai64N::UNIX_EPOCH,
-                    &c_init,
+                    &mut c_init,
                     &mut init_buf,
-                );
+                )
+                .unwrap();
 
                 let mut resp_buf = [0u8; RESP_MSG_LENGTH];
                 let h_resp = Handshake::receive(sk2.clone(), &mut init_buf)
@@ -39,9 +40,10 @@ fn bench_handshake(c: &mut Criterion) {
                         hs_resp,
                         None,
                         Tai64N::UNIX_EPOCH,
-                        &c_resp,
+                        &mut c_resp,
                         &mut resp_buf,
-                    );
+                    )
+                    .unwrap();
 
                 let h_init = h_init
                     .response_received(None, &mut resp_buf)

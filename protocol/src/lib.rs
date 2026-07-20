@@ -1,8 +1,13 @@
+//! A sans-IO implementation of the WireGuard protocol: handshake, transport,
+//! cookie, and per-peer state machinery with no sockets, clocks, or
+//! allocation.
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
 const AEAD_TAG_SIZE: usize = 16;
 const MAC_SIZE: usize = 16;
 
+/// Error parsing a message type byte.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MessageTypeParseError {
     #[error("invalid message type")]
@@ -31,6 +36,7 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
+/// Error parsing a [`MessageHeader`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MessageHeaderParseError {
     #[error("invalid message header length")]
@@ -46,6 +52,8 @@ pub enum MessageHeaderParseError {
     InvalidPeerIndex,
 }
 
+/// The type and receiver index of a validated WireGuard message, parsed from
+/// its leading bytes.
 pub enum MessageHeader {
     HandshakeInit,
     HandshakeResponse { receiver: u32 },
@@ -57,17 +65,26 @@ impl TryFrom<&[u8]> for MessageHeader {
     type Error = MessageHeaderParseError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.is_empty() {
+        if value.len() < 4 {
             return Err(MessageHeaderParseError::InvalidLength);
         }
         let msg_type = MessageType::try_from(value[0])?;
+        if value[1..4] != [0; 3] {
+            return Err(MessageHeaderParseError::InvalidHeader);
+        }
+        let valid_length = match msg_type {
+            MessageType::HandshakeInit => value.len() == handshake::INIT_MSG_LENGTH,
+            MessageType::HandshakeResp => value.len() == handshake::RESP_MSG_LENGTH,
+            MessageType::Cookie => value.len() == cookies::COOKIE_REPLY_LENGTH,
+            MessageType::Data => value.len() >= transport::Transport::packet_len(0),
+        };
+        if !valid_length {
+            return Err(MessageHeaderParseError::InvalidLength);
+        }
         let index_range = match msg_type {
             MessageType::HandshakeInit | MessageType::Cookie | MessageType::Data => 4..8,
             MessageType::HandshakeResp => 8..12,
         };
-        if value.len() < index_range.end {
-            return Err(MessageHeaderParseError::InvalidLength);
-        }
         let index = <u32>::from_le_bytes(value[index_range].try_into().unwrap());
         Ok(match msg_type {
             MessageType::HandshakeInit => MessageHeader::HandshakeInit,
@@ -84,8 +101,36 @@ pub mod transport;
 
 pub mod cookies;
 pub mod handshake;
+pub mod peer;
+pub mod time;
 
 pub use keys::{KeyParseError, PrivateKey, PublicKey};
 pub use tai64::*;
 use thiserror::Error;
 pub use x25519_dalek::ReusableSecret;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_header_rejects_reserved_bytes() {
+        let mut packet = [0u8; handshake::INIT_MSG_LENGTH];
+        packet[0] = MessageType::HandshakeInit as u8;
+        packet[1] = 1;
+        assert!(matches!(
+            MessageHeader::try_from(packet.as_slice()),
+            Err(MessageHeaderParseError::InvalidHeader)
+        ));
+    }
+
+    #[test]
+    fn message_header_rejects_wrong_fixed_length() {
+        let mut packet = [0u8; handshake::INIT_MSG_LENGTH + 1];
+        packet[0] = MessageType::HandshakeInit as u8;
+        assert!(matches!(
+            MessageHeader::try_from(packet.as_slice()),
+            Err(MessageHeaderParseError::InvalidLength)
+        ));
+    }
+}

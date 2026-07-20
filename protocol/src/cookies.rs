@@ -1,3 +1,6 @@
+//! Handshake MACs (mac1/mac2) and cookie replies, WireGuard's DoS
+//! mitigation.
+
 use core::{ops::Range, time::Duration};
 
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
@@ -7,7 +10,7 @@ use thiserror::Error;
 
 use crate::crypto::{Hash256, hash, mac, xaead_open, xaead_seal};
 use crate::keys::PublicKey;
-use crate::{MAC_SIZE, MessageType};
+use crate::{MAC_SIZE, MessageHeader, MessageType};
 
 const LABEL_MAC_1: &[u8] = b"mac1----";
 const LABEL_COOKIE: &[u8] = b"cookie--";
@@ -19,12 +22,17 @@ const CR_RECEIVER: Range<usize> = 4..8;
 const CR_NONCE: Range<usize> = 8..32;
 const CR_COOKIE: Range<usize> = 32..32 + COOKIE_SIZE;
 const CR_ENCRYPTED: Range<usize> = 32..64;
+/// Wire length of a cookie reply message.
 pub const COOKIE_REPLY_LENGTH: usize = 64;
 
+/// Error creating or processing a cookie message.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CookieError {
-    #[error("invalid cookie reply")]
+    #[error("invalid cookie message")]
     Invalid,
+
+    #[error("buffer too small: need {required} bytes")]
+    BufferTooSmall { required: usize },
 }
 
 fn mac1_offset(msg: &[u8]) -> usize {
@@ -46,6 +54,7 @@ pub struct Generator {
     mac1_key: Hash256,
     cookie_key: Hash256,
     last_cookie: Option<LastCookie>,
+    last_sent_mac1: Option<[u8; MAC_SIZE]>,
 }
 
 impl Generator {
@@ -55,17 +64,29 @@ impl Generator {
             mac1_key: hash(&[LABEL_MAC_1, public_key.as_bytes()]),
             cookie_key: hash(&[LABEL_COOKIE, public_key.as_bytes()]),
             last_cookie: None,
+            last_sent_mac1: None,
         }
     }
 
     /// Writes mac1, and mac2 if a fresh cookie is held, into the trailing MAC
     /// fields of a handshake message.
-    pub fn add_macs(&self, current_timestamp: &Tai64N, msg: &mut [u8]) {
+    pub fn add_macs(
+        &mut self,
+        current_timestamp: &Tai64N,
+        msg: &mut [u8],
+    ) -> Result<(), CookieError> {
+        if !matches!(
+            MessageHeader::try_from(&*msg),
+            Ok(MessageHeader::HandshakeInit | MessageHeader::HandshakeResponse { .. })
+        ) {
+            return Err(CookieError::Invalid);
+        }
         let mac_1_offset = mac1_offset(msg);
         let mac_2_offset = mac2_offset(msg);
 
         let mac_1 = mac(self.mac1_key.as_ref(), &[&msg[..mac_1_offset]]);
         msg[mac_1_offset..mac_2_offset].copy_from_slice(&mac_1);
+        msg[mac_2_offset..].fill(0);
 
         if let Some(last_cookie) = self.last_cookie.as_ref()
             && current_timestamp
@@ -76,20 +97,20 @@ impl Generator {
             let mac_2 = mac(&last_cookie.cookie, &[&msg[..mac_2_offset]]);
             msg[mac_2_offset..].copy_from_slice(&mac_2);
         }
+        self.last_sent_mac1 = Some(mac_1);
+        Ok(())
     }
 
     /// Decrypts a cookie reply the peer sent in response to a handshake and
     /// stores the cookie so subsequent handshakes carry a valid mac2.
-    /// `sent_mac1` is the mac1 of the handshake that prompted the reply.
-    pub fn process_cookie_reply(
-        &mut self,
-        reply: &[u8],
-        sent_mac1: &[u8],
-        now: &Tai64N,
-    ) -> Result<(), CookieError> {
-        if reply.len() != COOKIE_REPLY_LENGTH {
+    pub fn process_cookie_reply(&mut self, reply: &[u8], now: &Tai64N) -> Result<(), CookieError> {
+        if !matches!(
+            MessageHeader::try_from(reply),
+            Ok(MessageHeader::CookieReply { .. })
+        ) {
             return Err(CookieError::Invalid);
         }
+        let sent_mac1 = self.last_sent_mac1.ok_or(CookieError::Invalid)?;
         let cipher = XChaCha20Poly1305::new_from_slice(self.cookie_key.as_ref())
             .map_err(|_| CookieError::Invalid)?;
         let mut nonce = [0u8; 24];
@@ -99,7 +120,7 @@ impl Generator {
         xaead_open(
             &cipher,
             nonce,
-            sent_mac1,
+            &sent_mac1,
             &mut cookie,
             &reply[CR_COOKIE.end..CR_ENCRYPTED.end],
         )
@@ -131,6 +152,9 @@ impl Verifier {
 
     /// True if the message's mac1 is valid.
     pub fn verify_mac_1(&self, msg: &[u8]) -> bool {
+        if msg.len() < 2 * MAC_SIZE {
+            return false;
+        }
         let mac_1_offset = mac1_offset(msg);
         let mac_2_offset = mac2_offset(msg);
         let mac_1 = mac(self.mac1_key.as_ref(), &[&msg[..mac_1_offset]]);
@@ -147,13 +171,16 @@ impl Verifier {
     /// to `source`. A message from a peer that has never been cookied (mac2
     /// all zero) fails this, which is the point: it must round-trip a reply.
     pub fn verify_mac_2(&self, msg: &[u8], source: &[u8], secret: &[u8; 32]) -> bool {
+        if msg.len() < 2 * MAC_SIZE {
+            return false;
+        }
         let mac_2 = mac(&Self::cookie(source, secret), &[&msg[..mac2_offset(msg)]]);
         mac_2.ct_eq(&msg[mac2_offset(msg)..]).into()
     }
 
     /// Writes a cookie reply for the handshake in `prompting`, encrypting the
     /// cookie for `source` under a caller-supplied `nonce`. `out` must be
-    /// [`COOKIE_REPLY_LENGTH`] bytes.
+    /// at least [`COOKIE_REPLY_LENGTH`] bytes.
     pub fn write_cookie_reply(
         &self,
         prompting: &[u8],
@@ -161,7 +188,19 @@ impl Verifier {
         secret: &[u8; 32],
         nonce: [u8; 24],
         out: &mut [u8],
-    ) {
+    ) -> Result<(), CookieError> {
+        if !matches!(
+            MessageHeader::try_from(prompting),
+            Ok(MessageHeader::HandshakeInit | MessageHeader::HandshakeResponse { .. })
+        ) {
+            return Err(CookieError::Invalid);
+        }
+        if out.len() < COOKIE_REPLY_LENGTH {
+            return Err(CookieError::BufferTooSmall {
+                required: COOKIE_REPLY_LENGTH,
+            });
+        }
+        let out = &mut out[..COOKIE_REPLY_LENGTH];
         let cookie = Self::cookie(source, secret);
         let mut mac_1 = [0u8; MAC_SIZE];
         let m1 = mac1_offset(prompting);
@@ -175,6 +214,7 @@ impl Verifier {
         let cipher = XChaCha20Poly1305::new_from_slice(self.cookie_key.as_ref())
             .expect("cookie key is 32 bytes");
         xaead_seal(&cipher, nonce, &mac_1, &mut out[CR_ENCRYPTED]);
+        Ok(())
     }
 }
 
@@ -196,22 +236,22 @@ mod test {
         let nonce = [7u8; 24];
 
         let mut msg = [0u8; INIT_MSG_LENGTH];
-        generator.add_macs(&now, &mut msg);
+        msg[0] = MessageType::HandshakeInit as u8;
+        generator.add_macs(&now, &mut msg).unwrap();
         assert!(checker.verify_mac_1(&msg), "mac1 must verify");
         assert!(
             !checker.verify_mac_2(&msg, source, &secret),
             "no cookie yet: mac2 must not verify"
         );
-        let sent_mac1 = msg[mac1_offset(&msg)..mac2_offset(&msg)].to_vec();
-
         let mut reply = [0u8; COOKIE_REPLY_LENGTH];
-        checker.write_cookie_reply(&msg, source, &secret, nonce, &mut reply);
-
-        generator
-            .process_cookie_reply(&reply, &sent_mac1, &now)
+        checker
+            .write_cookie_reply(&msg, source, &secret, nonce, &mut reply)
             .unwrap();
+
+        generator.process_cookie_reply(&reply, &now).unwrap();
         let mut msg2 = [0u8; INIT_MSG_LENGTH];
-        generator.add_macs(&now, &mut msg2);
+        msg2[0] = MessageType::HandshakeInit as u8;
+        generator.add_macs(&now, &mut msg2).unwrap();
         assert!(
             checker.verify_mac_2(&msg2, source, &secret),
             "mac2 must verify after cookie"
@@ -230,14 +270,28 @@ mod test {
         let now = Tai64N::UNIX_EPOCH;
 
         let mut msg = [0u8; INIT_MSG_LENGTH];
-        generator.add_macs(&now, &mut msg);
-        let sent_mac1 = msg[mac1_offset(&msg)..mac2_offset(&msg)].to_vec();
+        msg[0] = MessageType::HandshakeInit as u8;
+        generator.add_macs(&now, &mut msg).unwrap();
 
         let mut reply = [0u8; COOKIE_REPLY_LENGTH];
-        checker.write_cookie_reply(&msg, b"a", &[1u8; 32], [0u8; 24], &mut reply);
+        checker
+            .write_cookie_reply(&msg, b"a", &[1u8; 32], [0u8; 24], &mut reply)
+            .unwrap();
         reply[40] ^= 0x01;
         assert_eq!(
-            generator.process_cookie_reply(&reply, &sent_mac1, &now),
+            generator.process_cookie_reply(&reply, &now),
+            Err(CookieError::Invalid)
+        );
+    }
+
+    #[test]
+    fn cookie_reply_requires_a_sent_handshake() {
+        let responder = PrivateKey::random().public_key();
+        let mut generator = Generator::new(responder);
+        let mut reply = [0u8; COOKIE_REPLY_LENGTH];
+        reply[0] = MessageType::Cookie as u8;
+        assert_eq!(
+            generator.process_cookie_reply(&reply, &Tai64N::UNIX_EPOCH),
             Err(CookieError::Invalid)
         );
     }
