@@ -42,7 +42,7 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
-use tunstile_tunnel::{Peer, PeerSender, Tunnel};
+use tunstile_tunnel::{Peer, PeerSender, RegisterError, Tunnel};
 
 mod allowed_ips;
 mod config;
@@ -61,7 +61,7 @@ pub enum DeviceError {
     Io(#[from] io::Error),
 
     #[error("peer already registered")]
-    DuplicatePeer,
+    AlreadyRegistered,
 
     #[error("invalid IP packet")]
     InvalidPacket,
@@ -193,13 +193,15 @@ impl Device {
     ) -> Result<(), DeviceError> {
         let _update = self.peer_updates.lock().await;
         if self.peers.read().unwrap().contains_key(public_key) {
-            return Err(DeviceError::DuplicatePeer);
+            return Err(DeviceError::AlreadyRegistered);
         }
         let peer = self
             .tunnel
             .add_peer(public_key, config.to_tunnel())
             .await
-            .map_err(|_| DeviceError::DuplicatePeer)?;
+            .map_err(|error| match error {
+                RegisterError::AlreadyRegistered => DeviceError::AlreadyRegistered,
+            })?;
         let sender = peer.sender();
         {
             let mut allowed_ips = self.allowed_ips.write().unwrap();
