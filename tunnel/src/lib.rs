@@ -78,7 +78,8 @@ pub enum RegisterError {
 /// Optional settings for a peer.
 #[derive(Debug, Clone, Default)]
 pub struct PeerConfig {
-    /// The peer's initial endpoint.
+    /// The peer's initial or replacement endpoint. When passed to
+    /// [`Tunnel::set_peer`], `None` keeps the current endpoint.
     pub endpoint: Option<SocketAddr>,
 
     /// The optional pre-shared key.
@@ -271,6 +272,18 @@ impl Tunnel {
             let _ = self.router.connect(peer.public_key(), endpoint).await;
         }
         Ok(peer)
+    }
+
+    /// Replaces a registered peer's pre-shared key and persistent keepalive
+    /// without unregistering it or discarding protocol state. A configured
+    /// endpoint also replaces the current endpoint; `None` leaves it alone.
+    /// `None` clears the pre-shared key or disables persistent keepalive.
+    pub async fn set_peer(
+        &self,
+        public_key: &PublicKey,
+        config: PeerConfig,
+    ) -> Result<(), SendError> {
+        self.router.set_config(public_key, config).await
     }
 
     /// This tunnel's public key.
@@ -636,13 +649,7 @@ mod tests {
         let addr_b = tunnel_b.local_addr().unwrap();
 
         let mut peer_a = tunnel_b
-            .add_peer(
-                &pk_a,
-                PeerConfig {
-                    preshared_key: Some(psk),
-                    ..Default::default()
-                },
-            )
+            .add_peer(&pk_a, PeerConfig::default())
             .await
             .unwrap();
         let peer_b = tunnel_a
@@ -650,7 +657,6 @@ mod tests {
                 &pk_b,
                 PeerConfig {
                     endpoint: Some(addr_b),
-                    preshared_key: Some(psk),
                     ..Default::default()
                 },
             )
@@ -661,12 +667,54 @@ mod tests {
             .await
             .expect("handshake did not complete")
             .unwrap();
+        let rx_before_update = peer_b.status().rx_bytes;
 
-        let payload = b"psk".to_vec();
+        tunnel_b
+            .set_peer(
+                &pk_a,
+                PeerConfig {
+                    preshared_key: Some(psk),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        tunnel_a
+            .set_peer(
+                &pk_b,
+                PeerConfig {
+                    preshared_key: Some(psk),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Updating the pre-shared key leaves the established session usable.
+        let payload = b"psk update".to_vec();
         peer_b.send(payload.clone()).await.unwrap();
         let data = tokio::time::timeout(Duration::from_secs(5), peer_a.recv())
             .await
             .expect("payload not delivered")
+            .unwrap();
+        assert_eq!(data, payload);
+
+        // A later handshake uses the updated key on both sides.
+        peer_b.connect(addr_b).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while peer_b.status().rx_bytes < rx_before_update + RESP_MSG_LENGTH as u64 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement handshake did not complete");
+
+        let payload = b"after psk update".to_vec();
+        peer_b.send(payload.clone()).await.unwrap();
+        let data = tokio::time::timeout(Duration::from_secs(5), peer_a.recv())
+            .await
+            .expect("payload not delivered after replacement handshake")
             .unwrap();
         assert_eq!(data, payload);
     }
@@ -735,13 +783,23 @@ mod tests {
                 &pk_b,
                 PeerConfig {
                     endpoint: Some(addr_b),
-                    persistent_keepalive: Some(Duration::from_millis(100)),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
         peer_b.ready().await.unwrap();
+
+        tunnel_a
+            .set_peer(
+                &pk_b,
+                PeerConfig {
+                    persistent_keepalive: Some(Duration::from_millis(100)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         let sent = peer_b.status().tx_bytes;
         tokio::time::sleep(Duration::from_millis(550)).await;

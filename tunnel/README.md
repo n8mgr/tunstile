@@ -41,8 +41,10 @@ async fn connect(
 ```
 
 Use `Peer::send` and `Peer::recv` for payloads. Dropping a `Peer` unregisters
-it. `Tunnel::from_socket` accepts an already-bound socket when the caller must
-configure it first, such as protecting an Android VPN socket.
+it. `Tunnel::set_peer` replaces the pre-shared key and persistent keepalive;
+a configured endpoint also replaces the current one. Protocol state remains
+intact. `Tunnel::from_socket` accepts an already-bound socket when the caller
+must configure it first, such as protecting an Android VPN socket.
 
 This implementation is experimental and has not been audited for production
 use.

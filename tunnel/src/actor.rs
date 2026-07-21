@@ -58,6 +58,7 @@ impl Clock {
 
 pub(crate) enum PeerAction {
     Connect(SocketAddr),
+    SetConfig(PeerConfig),
     SendData(Bytes),
     RecvData(Vec<u8>, u32, SocketAddr),
     RecvHandshakeInit(Handshake<InitReceived>, SocketAddr),
@@ -181,6 +182,17 @@ impl PeerActor {
         }
     }
 
+    async fn set_config(&mut self, config: PeerConfig) {
+        self.machine
+            .set_preshared_key(config.preshared_key.map(Into::into));
+        self.persistent_keepalive = config.persistent_keepalive;
+        if let Some(endpoint) = config.endpoint {
+            self.machine.set_endpoint(endpoint);
+            self.update_status(|status| status.endpoint = Some(endpoint));
+            self.ensure_handshake().await;
+        }
+    }
+
     /// The session became usable: flush staged sends, and as the initiator
     /// with nothing staged, confirm the session to the responder.
     async fn session_established(&mut self, initiator: bool) {
@@ -197,8 +209,10 @@ impl PeerActor {
         match action {
             PeerAction::Connect(endpoint) => {
                 self.machine.set_endpoint(endpoint);
+                self.update_status(|status| status.endpoint = Some(endpoint));
                 self.ensure_handshake().await;
             }
+            PeerAction::SetConfig(config) => self.set_config(config).await,
             PeerAction::SendData(payload) => {
                 let mut payloads = vec![payload];
                 self.flush_sends(&mut payloads).await;

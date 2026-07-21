@@ -124,6 +124,18 @@ impl RoutingTable {
             .map_err(|_| SendError::Closed)
     }
 
+    pub(crate) async fn set_config(
+        &self,
+        public_key: &PublicKey,
+        config: crate::PeerConfig,
+    ) -> Result<(), SendError> {
+        let sender = self.peer_key_sender(public_key).ok_or(SendError::Closed)?;
+        sender
+            .send(PeerAction::SetConfig(config))
+            .await
+            .map_err(|_| SendError::Closed)
+    }
+
     pub(crate) async fn send_data(
         &self,
         public_key: &PublicKey,

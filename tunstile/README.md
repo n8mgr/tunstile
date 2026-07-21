@@ -59,6 +59,11 @@ interface packets into `Device::send_packet` and inject packets returned by
 Interface addresses and operating-system routes remain the platform
 integration's responsibility.
 
+`Device::set_peer` replaces a registered peer's configuration in place.
+AllowedIPs change atomically, and the peer's protocol state remains intact.
+An endpoint in the new configuration replaces the current one; omitting it
+keeps the current or roamed endpoint.
+
 Android integrations can protect an already-bound UDP socket, pass it to
 `Device::from_socket`, and pump the detached VPN descriptor through the packet
 methods. Apple packet tunnel providers can bridge packet-flow callbacks to the

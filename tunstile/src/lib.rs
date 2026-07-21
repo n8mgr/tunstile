@@ -83,6 +83,7 @@ pub enum DeviceError {
 /// interface. Peers remain registered until removed from the device.
 pub struct Device {
     tunnel: Tunnel,
+    peer_updates: Mutex<()>,
     peers: RwLock<HashMap<PublicKey, PeerEntry>>,
     allowed_ips: AllowedIpTable,
     inbound_tx: mpsc::Sender<Bytes>,
@@ -104,6 +105,7 @@ impl Device {
         let (inbound_tx, inbound_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
         Self {
             tunnel,
+            peer_updates: Mutex::new(()),
             peers: RwLock::new(HashMap::new()),
             allowed_ips: Arc::new(RwLock::new(allowed_ips::AllowedIps::new())),
             inbound_tx,
@@ -178,6 +180,7 @@ impl Device {
         public_key: &PublicKey,
         config: PeerConfig,
     ) -> Result<(), DeviceError> {
+        let _update = self.peer_updates.lock().await;
         if self.peers.read().unwrap().contains_key(public_key) {
             return Err(DeviceError::DuplicatePeer);
         }
@@ -207,6 +210,35 @@ impl Device {
         Ok(())
     }
 
+    /// Replaces a registered peer's AllowedIPs, pre-shared key, and persistent
+    /// keepalive without unregistering it or discarding protocol state. A
+    /// configured endpoint also replaces the current endpoint; `None` leaves
+    /// it alone. `None` clears the pre-shared key or disables persistent
+    /// keepalive; an empty `allowed_ips` removes all of the peer's routes.
+    pub async fn set_peer(
+        &self,
+        public_key: &PublicKey,
+        config: PeerConfig,
+    ) -> Result<(), DeviceError> {
+        let _update = self.peer_updates.lock().await;
+        if !self.peers.read().unwrap().contains_key(public_key) {
+            return Err(DeviceError::UnknownPeer(public_key.clone()));
+        }
+
+        self.tunnel.set_peer(public_key, config.to_tunnel()).await?;
+
+        let peers = self.peers.read().unwrap();
+        let entry = peers
+            .get(public_key)
+            .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
+        let mut allowed_ips = self.allowed_ips.write().unwrap();
+        allowed_ips.retain(|owner| owner.public_key() != public_key);
+        for net in config.allowed_ips {
+            allowed_ips.insert(net, entry.sender.clone());
+        }
+        Ok(())
+    }
+
     /// Updates a peer's endpoint and initiates a handshake if none is in
     /// flight.
     pub async fn connect_peer(
@@ -214,6 +246,7 @@ impl Device {
         public_key: &PublicKey,
         endpoint: SocketAddr,
     ) -> Result<(), DeviceError> {
+        let _update = self.peer_updates.lock().await;
         let sender = self
             .peers
             .read()
@@ -227,6 +260,7 @@ impl Device {
 
     /// Unregisters a peer and removes its AllowedIPs.
     pub async fn remove_peer(&self, public_key: &PublicKey) -> bool {
+        let _update = self.peer_updates.lock().await;
         let entry = self.peers.write().unwrap().remove(public_key);
         let Some(entry) = entry else {
             return false;
@@ -401,12 +435,55 @@ mod tests {
                 .unwrap();
         assert_eq!(received, b_to_a);
 
+        device_a
+            .set_peer(
+                &public_b,
+                PeerConfig {
+                    allowed_ips: vec!["10.0.0.3/32".parse().unwrap()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            device_a.send_packet(a_to_b).await,
+            Err(DeviceError::NoPeer(address))
+                if address == "10.0.0.2".parse::<IpAddr>().unwrap()
+        ));
+
+        let rerouted = Bytes::from(ipv4_packet([10, 0, 0, 1], [10, 0, 0, 3]));
+        device_a.send_packet(rerouted.clone()).await.unwrap();
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), device_b.recv_packet())
+                .await
+                .expect("device B did not receive a rerouted packet")
+                .unwrap();
+        assert_eq!(received, rerouted);
+
+        let reconfigured_source = Bytes::from(ipv4_packet([10, 0, 0, 3], [10, 0, 0, 1]));
+        device_b
+            .send_packet(reconfigured_source.clone())
+            .await
+            .unwrap();
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), device_a.recv_packet())
+                .await
+                .expect("device A did not accept the reconfigured source")
+                .unwrap();
+        assert_eq!(received, reconfigured_source);
+
         assert!(device_a.remove_peer(&public_b).await);
         assert!(!device_a.remove_peer(&public_b).await);
         assert!(device_a.peer(&public_b).is_none());
         assert!(matches!(
             device_a
                 .connect_peer(&public_b, device_b.local_addr().unwrap())
+                .await,
+            Err(DeviceError::UnknownPeer(key)) if key == public_b
+        ));
+        assert!(matches!(
+            device_a
+                .set_peer(&public_b, PeerConfig::default())
                 .await,
             Err(DeviceError::UnknownPeer(key)) if key == public_b
         ));

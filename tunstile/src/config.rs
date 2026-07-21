@@ -5,7 +5,8 @@ use ipnet::IpNet;
 /// Optional settings and allowed IP prefixes for a peer.
 #[derive(Clone, Debug, Default)]
 pub struct PeerConfig {
-    /// The peer's initial endpoint.
+    /// The peer's initial or replacement endpoint. When passed to
+    /// [`crate::Device::set_peer`], `None` keeps the current endpoint.
     pub endpoint: Option<SocketAddr>,
 
     /// The optional pre-shared key.

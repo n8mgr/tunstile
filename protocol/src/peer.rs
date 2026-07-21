@@ -219,6 +219,12 @@ impl Peer {
         self
     }
 
+    /// Replaces or clears the pre-shared key without discarding transport
+    /// sessions or a pending handshake.
+    pub fn set_preshared_key(&mut self, preshared_key: Option<PresharedKey>) {
+        self.preshared_key = preshared_key;
+    }
+
     /// The peer's public key.
     pub fn peer_key(&self) -> &PublicKey {
         &self.peer_key
@@ -241,7 +247,7 @@ impl Peer {
     /// returns its index, which no longer routes to this peer. The driver
     /// owns the retransmit and abandonment schedule: call again to retransmit
     /// (each call is a fresh initiation), [`Peer::abandon_handshake`] to give
-    /// up.
+    /// up. Pass the same `our_key` to [`Peer::handshake_response`].
     pub fn initiate(
         &mut self,
         our_key: &PrivateKey,
@@ -329,7 +335,8 @@ impl Peer {
     /// and an initiator with nothing staged should confirm the session to
     /// the responder with a keepalive. Returns the index retired by the
     /// rotation, if any. An invalid response leaves the pending handshake
-    /// (and its retransmit schedule) intact.
+    /// (and its retransmit schedule) intact. `our_key` must be the key used
+    /// for the pending initiation.
     pub fn handshake_response(
         &mut self,
         our_key: &PrivateKey,
@@ -697,6 +704,27 @@ mod tests {
         assert_eq!(a.initiate(&a_key, values(8), &mut init), Ok(Some(7)));
         assert_eq!(a.abandon_handshake(), Some(8));
         assert_eq!(a.abandon_handshake(), None);
+    }
+
+    #[test]
+    fn preshared_key_update_preserves_pending_handshake() {
+        let now = ms(0);
+        let psk = PresharedKey::from([7u8; 32]);
+        let a_key = PrivateKey::random();
+        let b_key = PrivateKey::random();
+        let mut a = Peer::new(b_key.public_key());
+        let mut b = Peer::new(a_key.public_key()).preshared_key(psk.clone());
+
+        let mut init = [0u8; handshake::INIT_MSG_LENGTH];
+        a.initiate(&a_key, values(1), &mut init).unwrap();
+        a.set_preshared_key(Some(psk));
+
+        let received = Handshake::receive(&b_key, &mut init).unwrap();
+        let mut response = [0u8; handshake::RESP_MSG_LENGTH];
+        b.respond(now, received, values(2), addr(1), &mut response)
+            .unwrap();
+        a.handshake_response(&a_key, now, &mut response, addr(2))
+            .expect("the pending handshake should use the updated key");
     }
 
     #[test]
