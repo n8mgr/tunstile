@@ -7,11 +7,11 @@ use std::{
 };
 
 use bytes::Bytes;
-use spacetun_protocol::{
+use tokio::sync::mpsc::{self, Sender};
+use tunstile_protocol::{
     PublicKey,
     handshake::{Handshake, InitReceived},
 };
-use tokio::sync::mpsc::{self, Sender};
 
 use crate::{PeerStatus, SendError, actor::PeerAction};
 

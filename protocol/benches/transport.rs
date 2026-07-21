@@ -1,12 +1,12 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use rand::random;
-use spacetun_protocol::PrivateKey;
-use spacetun_protocol::{
+use tai64::Tai64N;
+use tunstile_protocol::PrivateKey;
+use tunstile_protocol::{
     cookies::Generator,
     handshake::{Handshake, INIT_MSG_LENGTH, RESP_MSG_LENGTH},
     transport::Transport,
 };
-use tai64::Tai64N;
 use x25519_dalek::ReusableSecret;
 
 fn complete_handshake() -> (Transport, Transport) {

@@ -1,10 +1,10 @@
 [package]
-name = "spacetun_tunnel"
+name = "tunstile_tunnel"
 version = "0.0.1"
 edition = "2024"
 description = "A pure Rust implementation of the Wireguard protocol"
 license = "MIT"
-repository = "https://github.com/n8mgr/spacetun"
+repository = "https://github.com/n8mgr/tunstile"
 keywords = ["wireguard", "vpn", "tunnel", "networking"]
 
 [dependencies]
@@ -16,7 +16,7 @@ hex = "0.4.3"
 log = "0.4.33"
 quinn-udp = { version = "0.6.1", features = ["fast-apple-datapath"] }
 rand = "0.10.2"
-spacetun_protocol = { path = "../protocol", features = ["std"] }
+tunstile_protocol = { path = "../protocol", features = ["std"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["fs", "net", "rt", "rt-multi-thread", "sync", "macros", "io-util", "time"] }
 

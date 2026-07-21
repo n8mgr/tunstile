@@ -1,10 +1,10 @@
 [package]
-name = "spacetun_protocol"
+name = "tunstile_protocol"
 version = "0.0.1"
 edition = "2024"
 description = "A Rust implementation of the Wireguard protocol"
 license = "MIT"
-repository = "https://github.com/n8mgr/spacetun"
+repository = "https://github.com/n8mgr/tunstile"
 keywords = ["wireguard", "vpn", "tunnel", "networking", "no_std"]
 
 [dependencies]

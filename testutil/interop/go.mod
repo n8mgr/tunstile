@@ -1,4 +1,4 @@
-module github.com/n8mgr/spacetun/test/interop
+module github.com/n8mgr/tunstile/test/interop
 
 go 1.25.0
 

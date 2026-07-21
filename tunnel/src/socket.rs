@@ -1,6 +1,6 @@
 use std::{
     io::{self, IoSliceMut},
-    net::SocketAddr,
+    net::{SocketAddr, UdpSocket as StdUdpSocket},
 };
 
 use quinn_udp::{RecvMeta, Transmit, UdpSocketState};
@@ -17,6 +17,15 @@ pub(crate) struct UdpSocket {
 impl UdpSocket {
     pub async fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
         let socket = TokioUdpSocket::bind(addr).await?;
+        Self::from_tokio(socket)
+    }
+
+    pub fn from_std(socket: StdUdpSocket) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Self::from_tokio(TokioUdpSocket::from_std(socket)?)
+    }
+
+    fn from_tokio(socket: TokioUdpSocket) -> io::Result<Self> {
         let socket_state = UdpSocketState::new((&socket).into())?;
 
         #[cfg(target_vendor = "apple")]

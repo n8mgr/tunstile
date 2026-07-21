@@ -8,8 +8,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use spacetun_protocol::PublicKey;
 use tokio::sync::{mpsc, watch};
+use tunstile_protocol::PublicKey;
 
 use crate::{PeerStatus, SendError, router::RoutingTable};
 

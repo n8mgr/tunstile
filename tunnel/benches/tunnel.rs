@@ -1,8 +1,8 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use spacetun_tunnel::{Bytes, Peer, PrivateKey, Tunnel};
 use tokio::{runtime::Runtime, sync::Mutex};
+use tunstile_tunnel::{Bytes, Peer, PrivateKey, Tunnel};
 
 const PAYLOAD_LEN: usize = 1420;
 const BATCH: usize = 256;

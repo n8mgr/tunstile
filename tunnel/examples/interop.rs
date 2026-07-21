@@ -1,10 +1,10 @@
 use clap::Parser;
 use etherparse::PacketBuilder;
-use spacetun_tunnel::{PrivateKey, PublicKey, Tunnel};
 use std::{net::SocketAddr, time::Duration};
 use tokio::time::{Instant, interval, sleep_until};
+use tunstile_tunnel::{PrivateKey, PublicKey, Tunnel};
 
-/// Exercises a spacetun tunnel against a reference WireGuard peer
+/// Exercises a tunstile tunnel against a reference WireGuard peer
 /// (testutil/interop). Set RUST_LOG=debug for tunnel internals.
 #[derive(Parser)]
 struct Args {

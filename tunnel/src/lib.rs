@@ -1,5 +1,5 @@
 //! An async WireGuard tunnel: peers, sessions, and timers over one UDP
-//! socket, driving the sans-IO state machines in `spacetun_protocol`.
+//! socket, driving the sans-IO state machines in `tunstile_protocol`.
 
 use std::{
     io::{self, IoSliceMut},
@@ -14,14 +14,14 @@ use std::{
 pub use bytes::Bytes;
 use log::debug;
 use quinn_udp::{BATCH_SIZE, RecvMeta};
-pub use spacetun_protocol::{KeyParseError, PrivateKey, PublicKey};
-use spacetun_protocol::{
+use thiserror::Error;
+use tokio::{spawn, task::JoinHandle};
+pub use tunstile_protocol::{KeyParseError, PrivateKey, PublicKey};
+use tunstile_protocol::{
     MessageHeader,
     handshake::Handshake,
     peer::{COOKIE_SECRET_ROTATION, HandshakeDecision, LoadGuard},
 };
-use thiserror::Error;
-use tokio::{spawn, task::JoinHandle};
 
 mod actor;
 mod peer;
@@ -273,7 +273,22 @@ impl Tunnel {
 
     /// Binds the UDP socket and starts the tunnel's receive loop.
     pub async fn new(addr: SocketAddr, our_key: PrivateKey) -> io::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind(addr).await?);
+        let socket = UdpSocket::bind(addr).await?;
+        Ok(Self::start(socket, our_key))
+    }
+
+    /// Starts the tunnel's receive loop using an already-bound UDP socket.
+    ///
+    /// Takes ownership of the socket. This lets callers apply platform-specific
+    /// configuration, such as protecting an Android VPN socket, before any
+    /// tunnel traffic is sent.
+    pub async fn from_socket(socket: std::net::UdpSocket, our_key: PrivateKey) -> io::Result<Self> {
+        let socket = UdpSocket::from_std(socket)?;
+        Ok(Self::start(socket, our_key))
+    }
+
+    fn start(socket: UdpSocket, our_key: PrivateKey) -> Self {
+        let socket = Arc::new(socket);
         let router = Arc::new(RoutingTable::new());
         let under_load = Arc::new(AtomicBool::new(false));
         let read_task = spawn(Self::read_loop(
@@ -282,14 +297,14 @@ impl Tunnel {
             router.clone(),
             under_load.clone(),
         ));
-        Ok(Self {
+        Self {
             our_key,
             socket,
             router,
             #[cfg(test)]
             under_load,
             read_task,
-        })
+        }
     }
 
     #[cfg(test)]
@@ -300,7 +315,7 @@ impl Tunnel {
 
 #[cfg(test)]
 mod tests {
-    use spacetun_protocol::{
+    use tunstile_protocol::{
         handshake::{INIT_MSG_LENGTH, RESP_MSG_LENGTH},
         transport::Transport,
     };
@@ -310,6 +325,18 @@ mod tests {
 
     fn loopback() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    }
+
+    #[tokio::test]
+    async fn starts_with_existing_socket() {
+        let socket = std::net::UdpSocket::bind(loopback()).unwrap();
+        let local_addr = socket.local_addr().unwrap();
+
+        let tunnel = Tunnel::from_socket(socket, PrivateKey::random())
+            .await
+            .unwrap();
+
+        assert_eq!(tunnel.local_addr().unwrap(), local_addr);
     }
 
     // The responder is forced under load, so the initiator's first handshake is

@@ -11,7 +11,15 @@ use std::{
 use bytes::Bytes;
 use log::debug;
 use quinn_udp::BATCH_SIZE;
-use spacetun_protocol::{
+use tokio::{
+    select,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        watch,
+    },
+    time::{Instant, interval},
+};
+use tunstile_protocol::{
     PrivateKey, PublicKey, ReusableSecret, Tai64N,
     handshake::{Handshake, INIT_MSG_LENGTH, InitReceived, RESP_MSG_LENGTH},
     peer::{
@@ -20,14 +28,6 @@ use spacetun_protocol::{
     },
     time::Instant as Timestamp,
     transport::Transport,
-};
-use tokio::{
-    select,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        watch,
-    },
-    time::{Instant, interval},
 };
 
 use crate::{PeerConfig, PeerStatus, peer, router::RoutingTable, socket::UdpSocket};
