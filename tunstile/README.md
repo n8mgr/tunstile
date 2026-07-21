@@ -1,12 +1,13 @@
 # tunstile
 
-`tunstile` is the complete Tunstile device library and command-line program. It
-combines a TUN interface, AllowedIPs routing and source validation, and the UDP
-tunnel provided by `tunstile_tunnel`.
+`tunstile` is the complete Tunstile device library and command-line program.
+`Device` applies AllowedIPs routing and source validation to IP packets. A
+platform integration exchanges packets through `Device::send_packet` and
+`Device::recv_packet`.
 
-This is the top layer. Applications that already own their packet interface can
-use `Device::from_fd`; applications that need peer-oriented encrypted payloads
-without IP routing can use `tunstile_tunnel` directly.
+This is the top layer. Packet-oriented integrations drive those methods
+directly; applications that need peer-oriented encrypted payloads without IP
+routing can use `tunstile_tunnel` directly.
 
 ## Command line
 
@@ -29,29 +30,39 @@ route installation is currently implemented only on macOS.
 
 ```rust
 use std::{error::Error, net::SocketAddr};
-use tunstile::{Device, DeviceConfig, DevicePeer, PeerConfig, PrivateKey, PublicKey};
+use tunstile::{Device, PeerConfig, PrivateKey, PublicKey};
 
 async fn start(
     private_key: PrivateKey,
     peer_key: PublicKey,
     endpoint: SocketAddr,
-) -> Result<(Device, DevicePeer), Box<dyn Error>> {
-    let device = Device::new(DeviceConfig::new(private_key, "10.0.0.2/32".parse()?)).await?;
-    let peer = device
+) -> Result<Device, Box<dyn Error>> {
+    let device = Device::new("0.0.0.0:0".parse()?, private_key).await?;
+    device
         .add_peer(
-            PeerConfig::new(peer_key)
-                .endpoint(endpoint)
-                .allowed_ip("0.0.0.0/0".parse()?),
+            &peer_key,
+            PeerConfig {
+                endpoint: Some(endpoint),
+                allowed_ips: vec!["0.0.0.0/0".parse()?],
+                ..Default::default()
+            },
         )
         .await?;
 
-    Ok((device, peer))
+    Ok(device)
 }
 ```
 
-Keep each returned `DevicePeer` alive for as long as the peer should remain
-registered. Installing matching routes in the operating system is the caller's
-responsibility when using the library.
+Peers remain registered until removed with `Device::remove_peer`. Feed outbound
+interface packets into `Device::send_packet` and inject packets returned by
+`Device::recv_packet`. Only one `recv_packet` call may be active at a time.
+Interface addresses and operating-system routes remain the platform
+integration's responsibility.
+
+Android integrations can protect an already-bound UDP socket, pass it to
+`Device::from_socket`, and pump the detached VPN descriptor through the packet
+methods. Apple packet tunnel providers can bridge packet-flow callbacks to the
+same methods.
 
 This implementation is experimental and has not been audited for production
 use.

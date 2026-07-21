@@ -1,106 +1,142 @@
-//! A WireGuard device combining a TUN interface, AllowedIPs routing and source
-//! validation, and [tunstile_tunnel].
+//! A packet-oriented WireGuard device with AllowedIPs routing and source
+//! validation.
 //!
 //! # Example
 //!
 //! ```no_run
 //! use std::{error::Error, net::SocketAddr};
-//! use tunstile::{Device, DeviceConfig, DevicePeer, PeerConfig, PrivateKey, PublicKey};
+//! use tunstile::{Device, PeerConfig, PrivateKey, PublicKey};
 //!
 //! async fn start(
 //!     private_key: PrivateKey,
 //!     peer_key: PublicKey,
 //!     endpoint: SocketAddr,
-//! ) -> Result<(Device, DevicePeer), Box<dyn Error>> {
-//!     let config = DeviceConfig::new(private_key, "10.0.0.2/32".parse()?);
-//!     let device = Device::new(config).await?;
-//!     let peer = device
+//! ) -> Result<Device, Box<dyn Error>> {
+//!     let device = Device::new("0.0.0.0:0".parse()?, private_key).await?;
+//!     device
 //!         .add_peer(
-//!             PeerConfig::new(peer_key)
-//!                 .endpoint(endpoint)
-//!                 .allowed_ip("0.0.0.0/0".parse()?),
+//!             &peer_key,
+//!             PeerConfig {
+//!                 endpoint: Some(endpoint),
+//!                 allowed_ips: vec!["0.0.0.0/0".parse()?],
+//!                 ..Default::default()
+//!             },
 //!         )
 //!         .await?;
-//!     Ok((device, peer))
+//!     Ok(device)
 //! }
 //! ```
 
 use std::{
+    collections::HashMap,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    os::fd::{IntoRawFd, OwnedFd},
     sync::{Arc, RwLock},
 };
 
-use bytes::BytesMut;
+pub use bytes::Bytes;
 use log::debug;
 use thiserror::Error;
-use tokio::{spawn, task::JoinHandle};
-use tun::{AbstractDevice, AsyncDevice};
-use tunstile_tunnel::{Peer, PeerSender, RegisterError, SendError, Tunnel};
+use tokio::{
+    spawn,
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
+use tunstile_tunnel::{Peer, PeerSender, Tunnel};
 
 mod allowed_ips;
 mod config;
-pub use config::{DeviceConfig, PeerConfig};
-pub use ipnet;
-pub use tunstile_tunnel::{PeerStatus, PrivateKey, PublicKey};
+pub use config::PeerConfig;
+pub use ipnet::IpNet;
+pub use tunstile_tunnel::{KeyParseError, PeerStatus, PrivateKey, PublicKey, SendError};
 
 type AllowedIpTable = Arc<RwLock<allowed_ips::AllowedIps<PeerSender>>>;
 
-/// Error bringing up a device or adding a peer.
+const PACKET_QUEUE_CAPACITY: usize = 1024;
+
+/// Error creating or operating a device.
 #[derive(Debug, Error)]
 pub enum DeviceError {
-    #[error("tun interface error: {0}")]
-    Tun(#[from] tun::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
 
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("peer already registered")]
+    DuplicatePeer,
 
-    #[error("duplicate peer")]
-    DuplicatePeer(#[from] RegisterError),
+    #[error("invalid IP packet")]
+    InvalidPacket,
 
-    #[error("interface address {0} is not an IPv4 address")]
-    UnsupportedAddress(IpAddr),
+    #[error("no peer allows destination {0}")]
+    NoPeer(IpAddr),
+
+    #[error("peer {0} is not registered")]
+    UnknownPeer(PublicKey),
+
+    #[error(transparent)]
+    Send(#[from] SendError),
 }
 
-/// A WireGuard interface. Owns the TUN device and the outbound datapath;
-/// peers are added at runtime with [`Device::add_peer`] and removed by
-/// dropping the returned [`DevicePeer`].
+/// A WireGuard device that routes plaintext IP packets to and from peers.
 ///
-/// # Example
-///
-/// ```no_run
-/// use tunstile::{Device, DeviceConfig, PeerConfig, PrivateKey};
-///
-/// # async fn start() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = DeviceConfig::new(PrivateKey::random(), "10.0.0.2/32".parse()?);
-/// let device = Device::new(config).await?;
-/// let peer = PeerConfig::new(
-///     "jrpP5X9mNSxjkd6tCnHwdRI4Rp8ZnquQj34UAqlZpx8=".parse()?,
-/// )
-/// .endpoint("203.0.113.1:51820".parse()?)
-/// .allowed_ip("10.1.0.0/16".parse()?);
-/// let _peer = device.add_peer(peer).await?;
-/// # Ok(())
-/// # }
-/// ```
+/// [`Device::send_packet`] accepts packets from a platform network interface.
+/// [`Device::recv_packet`] returns authenticated packets to inject into that
+/// interface. Peers remain registered until removed from the device.
 pub struct Device {
     tunnel: Tunnel,
-    tun: Arc<AsyncDevice>,
+    peers: RwLock<HashMap<PublicKey, PeerEntry>>,
     allowed_ips: AllowedIpTable,
-    outbound: JoinHandle<()>,
+    inbound_tx: mpsc::Sender<Bytes>,
+    inbound_rx: Mutex<mpsc::Receiver<Bytes>>,
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
-        self.outbound.abort();
+        if let Ok(peers) = self.peers.get_mut() {
+            for entry in peers.values() {
+                entry.task.abort();
+            }
+        }
     }
 }
 
 impl Device {
-    /// The name of the created TUN interface (e.g. `utun4`), or `None` when
-    /// the device wraps an externally created fd.
-    pub fn tun_name(&self) -> Option<String> {
-        self.tun.tun_name().ok().filter(|n| !n.is_empty())
+    fn start(tunnel: Tunnel) -> Self {
+        let (inbound_tx, inbound_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        Self {
+            tunnel,
+            peers: RwLock::new(HashMap::new()),
+            allowed_ips: Arc::new(RwLock::new(allowed_ips::AllowedIps::new())),
+            inbound_tx,
+            inbound_rx: Mutex::new(inbound_rx),
+        }
+    }
+
+    /// Binds the UDP socket and creates a device with no peers.
+    pub async fn new(
+        listen_addr: SocketAddr,
+        private_key: PrivateKey,
+    ) -> Result<Self, DeviceError> {
+        let tunnel = Tunnel::new(listen_addr, private_key).await?;
+        Ok(Self::start(tunnel))
+    }
+
+    /// Creates a device using an already-bound UDP socket.
+    pub async fn from_socket(
+        socket: std::net::UdpSocket,
+        private_key: PrivateKey,
+    ) -> Result<Self, DeviceError> {
+        let tunnel = Tunnel::from_socket(socket, private_key).await?;
+        Ok(Self::start(tunnel))
+    }
+
+    /// This device's public key.
+    pub fn public_key(&self) -> PublicKey {
+        self.tunnel.public_key()
+    }
+
+    /// The local UDP address used for encrypted tunnel traffic.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.tunnel.local_addr()
     }
 
     /// Status snapshots for every registered peer.
@@ -113,63 +149,43 @@ impl Device {
         self.tunnel.peer(public_key)
     }
 
-    /// Brings up the TUN interface and starts the tunnel with no peers.
-    pub async fn new(config: DeviceConfig) -> Result<Self, DeviceError> {
-        let IpAddr::V4(addr) = config.address.addr() else {
-            return Err(DeviceError::UnsupportedAddress(config.address.addr()));
-        };
-        let netmask = Ipv4Addr::from(
-            u32::MAX
-                .checked_shl(32 - config.address.prefix_len() as u32)
-                .unwrap_or(0),
-        );
-
-        let mut tun_config = tun::Configuration::default();
-        tun_config
-            .address(addr)
-            .netmask(netmask)
-            .mtu(config.mtu)
-            .up();
-        let tun = tun::create_as_async(&tun_config)?;
-        Self::start(tun, config).await
+    /// Routes an outbound IP packet to the peer with the most-specific
+    /// matching AllowedIP.
+    pub async fn send_packet(&self, packet: impl Into<Bytes>) -> Result<(), DeviceError> {
+        let packet = packet.into();
+        let destination = packet_dst(&packet).ok_or(DeviceError::InvalidPacket)?;
+        let sender = self
+            .allowed_ips
+            .read()
+            .unwrap()
+            .longest_match(destination)
+            .cloned()
+            .ok_or(DeviceError::NoPeer(destination))?;
+        sender.send(packet).await?;
+        Ok(())
     }
 
-    /// Wraps an externally created TUN fd — e.g. detached from Android's
-    /// `VpnService` — and starts the tunnel with no peers. Takes ownership of
-    /// the fd; it is closed when the device is dropped. The config's address
-    /// is not applied and its MTU only sizes internal buffers; the embedder
-    /// owns the interface's configuration.
-    pub async fn from_fd(fd: OwnedFd, config: DeviceConfig) -> Result<Self, DeviceError> {
-        let mut tun_config = tun::Configuration::default();
-        tun_config.raw_fd(fd.into_raw_fd()).mtu(config.mtu);
-        let tun = tun::create_as_async(&tun_config)?;
-        Self::start(tun, config).await
+    /// Receives the next authenticated inbound IP packet.
+    ///
+    /// Only one receiver should call this method at a time.
+    pub async fn recv_packet(&self) -> Option<Bytes> {
+        self.inbound_rx.lock().await.recv().await
     }
 
-    async fn start(tun: AsyncDevice, config: DeviceConfig) -> Result<Self, DeviceError> {
-        let tun = Arc::new(tun);
-        let tunnel = Tunnel::new(config.listen_addr, config.private_key).await?;
-        let allowed_ips: AllowedIpTable = Arc::new(RwLock::new(allowed_ips::AllowedIps::new()));
-        let outbound = spawn(outbound_loop(
-            tun.clone(),
-            allowed_ips.clone(),
-            config.mtu as usize,
-        ));
-
-        Ok(Self {
-            tunnel,
-            tun,
-            allowed_ips,
-            outbound,
-        })
-    }
-
-    /// Registers a peer, adds its allowed IPs to cryptokey routing, and
-    /// starts delivering its inbound packets. The peer stays active until
-    /// the returned handle is dropped. Installing OS routes for the allowed
-    /// IPs is the caller's job.
-    pub async fn add_peer(&self, config: PeerConfig) -> Result<DevicePeer, DeviceError> {
-        let peer = self.tunnel.add_peer(config.to_tunnel()).await?;
+    /// Registers a peer and its AllowedIPs.
+    pub async fn add_peer(
+        &self,
+        public_key: &PublicKey,
+        config: PeerConfig,
+    ) -> Result<(), DeviceError> {
+        if self.peers.read().unwrap().contains_key(public_key) {
+            return Err(DeviceError::DuplicatePeer);
+        }
+        let peer = self
+            .tunnel
+            .add_peer(public_key, config.to_tunnel())
+            .await
+            .map_err(|_| DeviceError::DuplicatePeer)?;
         let sender = peer.sender();
         {
             let mut allowed_ips = self.allowed_ips.write().unwrap();
@@ -178,102 +194,74 @@ impl Device {
             }
         }
         let task = spawn(inbound_loop(
-            self.tun.clone(),
+            self.inbound_tx.clone(),
             self.allowed_ips.clone(),
             peer,
         ));
-        Ok(DevicePeer {
-            public_key: config.public_key,
-            sender,
-            allowed_ips: self.allowed_ips.clone(),
-            task,
-        })
+        let previous = self
+            .peers
+            .write()
+            .unwrap()
+            .insert(public_key.clone(), PeerEntry { sender, task });
+        debug_assert!(previous.is_none());
+        Ok(())
     }
-}
 
-/// A registered peer. Dropping it unregisters the peer, removes its
-/// AllowedIPs entries, and stops delivering its packets.
-#[must_use = "dropping the DevicePeer removes the peer and its AllowedIPs"]
-pub struct DevicePeer {
-    public_key: PublicKey,
-    sender: PeerSender,
-    allowed_ips: AllowedIpTable,
-    task: JoinHandle<()>,
-}
+    /// Updates a peer's endpoint and initiates a handshake if none is in
+    /// flight.
+    pub async fn connect_peer(
+        &self,
+        public_key: &PublicKey,
+        endpoint: SocketAddr,
+    ) -> Result<(), DeviceError> {
+        let sender = self
+            .peers
+            .read()
+            .unwrap()
+            .get(public_key)
+            .map(|entry| entry.sender.clone())
+            .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
+        sender.connect(endpoint).await?;
+        Ok(())
+    }
 
-impl Drop for DevicePeer {
-    fn drop(&mut self) {
-        // aborting the inbound task drops the tunnel Peer, unregistering it
-        self.task.abort();
+    /// Unregisters a peer and removes its AllowedIPs.
+    pub async fn remove_peer(&self, public_key: &PublicKey) -> bool {
+        let entry = self.peers.write().unwrap().remove(public_key);
+        let Some(entry) = entry else {
+            return false;
+        };
         self.allowed_ips
             .write()
             .unwrap()
-            .retain(|s| s.public_key() != self.public_key);
+            .retain(|sender| sender.public_key() != public_key);
+        entry.task.abort();
+        let _ = entry.task.await;
+        true
     }
 }
 
-impl DevicePeer {
-    /// This peer's public key.
-    pub fn public_key(&self) -> PublicKey {
-        self.public_key
-    }
-
-    /// Current status snapshot for this peer.
-    pub fn status(&self) -> Option<PeerStatus> {
-        self.sender.status()
-    }
-
-    /// Updates the peer's endpoint (e.g. after a DNS re-resolve) and
-    /// initiates a handshake if none is in flight.
-    pub async fn connect(&self, endpoint: SocketAddr) -> Result<(), SendError> {
-        self.sender.connect(endpoint).await
-    }
+struct PeerEntry {
+    sender: PeerSender,
+    task: JoinHandle<()>,
 }
 
-async fn outbound_loop(tun: Arc<AsyncDevice>, allowed_ips: AllowedIpTable, mtu: usize) {
-    let mut buf = BytesMut::with_capacity(mtu);
-    loop {
-        buf.resize(mtu, 0);
-        let n = match tun.recv(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => {
-                debug!("tun recv failed: {:?}", e);
-                continue;
-            }
-        };
-        buf.truncate(n);
-        let packet = buf.split().freeze();
-        let Some(dst) = packet_dst(&packet) else {
-            continue;
-        };
-        let sender = allowed_ips.read().unwrap().longest_match(dst).cloned();
-        let Some(sender) = sender else {
-            debug!("no peer for destination {dst}; dropping");
-            continue;
-        };
-        let _ = sender.send(packet).await;
-    }
-}
-
-async fn inbound_loop(tun: Arc<AsyncDevice>, allowed_ips: AllowedIpTable, mut peer: Peer) {
-    let peer_key = peer.public_key();
+async fn inbound_loop(inbound: mpsc::Sender<Bytes>, allowed_ips: AllowedIpTable, mut peer: Peer) {
     while let Some(packet) = peer.recv().await {
-        let Some(src) = packet_src(&packet) else {
+        let Some(source) = packet_src(&packet) else {
             continue;
         };
-        // anti-spoofing: the source's most-specific AllowedIP must belong to
-        // the sending peer
-        let owner = allowed_ips
+        let valid_source = allowed_ips
             .read()
             .unwrap()
-            .longest_match(src)
-            .map(|s| s.public_key());
-        if owner != Some(peer_key) {
-            debug!("inbound packet from unexpected source {src}; dropping");
+            .longest_match(source)
+            .is_some_and(|sender| sender.public_key() == peer.public_key());
+        if !valid_source {
+            debug!("inbound packet from unexpected source {source}; dropping");
             continue;
         }
-        if let Err(e) = tun.send(&packet).await {
-            debug!("tun send failed: {:?}", e);
+        if inbound.send(packet).await.is_err() {
+            break;
         }
     }
 }
@@ -308,12 +296,17 @@ fn v6(bytes: &[u8]) -> Ipv6Addr {
 mod tests {
     use super::*;
 
+    fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
+        let mut packet = vec![0x45, 0, 0, 20];
+        packet.extend_from_slice(&[0; 8]);
+        packet.extend_from_slice(&source);
+        packet.extend_from_slice(&destination);
+        packet
+    }
+
     #[test]
     fn extracts_v4_addresses() {
-        let mut pkt = vec![0x45, 0, 0, 20];
-        pkt.extend_from_slice(&[0; 8]);
-        pkt.extend_from_slice(&[10, 0, 0, 1]);
-        pkt.extend_from_slice(&[10, 0, 0, 2]);
+        let pkt = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]);
         assert_eq!(packet_src(&pkt), Some("10.0.0.1".parse().unwrap()));
         assert_eq!(packet_dst(&pkt), Some("10.0.0.2".parse().unwrap()));
     }
@@ -334,5 +327,88 @@ mod tests {
         assert_eq!(packet_dst(&[]), None);
         assert_eq!(packet_dst(&[0x45, 0, 0]), None);
         assert_eq!(packet_dst(&[0x25, 0, 0, 0]), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn routes_packets_between_devices() {
+        let private_a = PrivateKey::random();
+        let public_a = private_a.public_key();
+        let private_b = PrivateKey::random();
+        let public_b = private_b.public_key();
+
+        let device_a = Device::new("127.0.0.1:0".parse().unwrap(), private_a)
+            .await
+            .unwrap();
+        let device_b = Device::new("127.0.0.1:0".parse().unwrap(), private_b)
+            .await
+            .unwrap();
+
+        assert_eq!(device_a.public_key(), public_a);
+        assert_eq!(device_b.public_key(), public_b);
+
+        device_b
+            .add_peer(
+                &public_a,
+                PeerConfig {
+                    allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        device_a
+            .add_peer(
+                &public_b,
+                PeerConfig {
+                    allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        device_a
+            .connect_peer(&public_b, device_b.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        let a_to_b = Bytes::from(ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]));
+        let b_to_a = Bytes::from(ipv4_packet([10, 0, 0, 2], [10, 0, 0, 1]));
+        assert!(matches!(
+            device_a.send_packet(Bytes::from_static(b"invalid")).await,
+            Err(DeviceError::InvalidPacket)
+        ));
+        assert!(matches!(
+            device_a
+                .send_packet(ipv4_packet([10, 0, 0, 1], [10, 0, 0, 3]))
+                .await,
+            Err(DeviceError::NoPeer(address))
+                if address == "10.0.0.3".parse::<IpAddr>().unwrap()
+        ));
+
+        device_a.send_packet(a_to_b.clone()).await.unwrap();
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), device_b.recv_packet())
+                .await
+                .expect("device B did not receive a packet")
+                .unwrap();
+        assert_eq!(received, a_to_b);
+
+        device_b.send_packet(b_to_a.clone()).await.unwrap();
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), device_a.recv_packet())
+                .await
+                .expect("device A did not receive a packet")
+                .unwrap();
+        assert_eq!(received, b_to_a);
+
+        assert!(device_a.remove_peer(&public_b).await);
+        assert!(!device_a.remove_peer(&public_b).await);
+        assert!(device_a.peer(&public_b).is_none());
+        assert!(matches!(
+            device_a
+                .connect_peer(&public_b, device_b.local_addr().unwrap())
+                .await,
+            Err(DeviceError::UnknownPeer(key)) if key == public_b
+        ));
     }
 }

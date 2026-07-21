@@ -22,7 +22,16 @@ impl<T> AllowedIps<T> {
     }
 
     pub fn insert(&mut self, net: IpNet, value: T) {
-        self.entries.push((net.trunc(), value));
+        let net = net.trunc();
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|(existing, _)| *existing == net)
+        {
+            entry.1 = value;
+        } else {
+            self.entries.push((net, value));
+        }
     }
 
     /// Drops every entry whose value fails the predicate. Used to remove a
@@ -92,5 +101,14 @@ mod tests {
         t.insert(net("10.0.0.7/32"), "host");
         assert_eq!(t.longest_match(ip("10.0.0.7")), Some(&"host"));
         assert_eq!(t.longest_match(ip("10.0.0.8")), Some(&"subnet"));
+    }
+
+    #[test]
+    fn exact_prefix_replaces_owner() {
+        let mut t = AllowedIps::new();
+        t.insert(net("10.0.0.1/24"), "old");
+        t.insert(net("10.0.0.2/24"), "new");
+
+        assert_eq!(t.longest_match(ip("10.0.0.7")), Some(&"new"));
     }
 }

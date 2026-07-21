@@ -95,6 +95,7 @@ impl SessionTimers {
 
 struct PeerActor {
     label: String,
+    our_key: Arc<PrivateKey>,
     machine: PeerState,
     clock: Clock,
 
@@ -144,7 +145,7 @@ impl PeerActor {
             ephemeral_secret: ReusableSecret::random(),
             timestamp: Tai64N::now(),
         };
-        let replaced = match self.machine.initiate(values, &mut msg) {
+        let replaced = match self.machine.initiate(&self.our_key, values, &mut msg) {
             Ok(replaced) => replaced,
             Err(e) => {
                 debug!("[{}] failed to create handshake: {:?}", self.label, e);
@@ -153,7 +154,7 @@ impl PeerActor {
         };
         self.retire_index(replaced);
         if let Some(router) = self.router.upgrade() {
-            router.bind_index(&self.machine.peer_key(), index);
+            router.bind_index(self.machine.peer_key(), index);
         }
         self.handshake = Some(HandshakeTimers {
             first_sent,
@@ -265,7 +266,7 @@ impl PeerActor {
                 };
                 self.retire_index(displaced);
                 if let Some(router) = self.router.upgrade() {
-                    router.bind_index(&self.machine.peer_key(), index);
+                    router.bind_index(self.machine.peer_key(), index);
                 }
                 if let Err(e) = self.socket.send(endpoint, &msg).await {
                     debug!(
@@ -289,7 +290,10 @@ impl PeerActor {
             }
             PeerAction::RecvHandshakeResp(mut resp, endpoint) => {
                 let rx_bytes = resp.len() as u64;
-                match self.machine.handshake_response(now, &mut resp, endpoint) {
+                match self
+                    .machine
+                    .handshake_response(&self.our_key, now, &mut resp, endpoint)
+                {
                     Ok(retired) => {
                         self.retire_index(retired);
                         self.handshake = None;
@@ -536,7 +540,8 @@ fn peer_label(key: &PublicKey) -> String {
 
 /// Spawns the driver task for a registered peer and returns its handle.
 pub(crate) fn spawn(
-    our_key: PrivateKey,
+    our_key: Arc<PrivateKey>,
+    public_key: PublicKey,
     config: &PeerConfig,
     router: Weak<RoutingTable>,
     socket: Arc<UdpSocket>,
@@ -545,13 +550,16 @@ pub(crate) fn spawn(
 ) -> peer::Peer {
     let (data_tx, data_rx) = mpsc::channel(PEER_INBOUND_QUEUE);
     let (session_tx, session_rx) = watch::channel(false);
-    let mut machine = PeerState::new(our_key, config.public_key);
+    let label = peer_label(&public_key);
+    let peer_key = public_key.clone();
+    let mut machine = PeerState::new(public_key);
     if let Some(psk) = config.preshared_key {
-        machine = machine.preshared_key(psk);
+        machine = machine.preshared_key(psk.into());
     }
     tokio::spawn(
         PeerActor {
-            label: peer_label(&config.public_key),
+            label,
+            our_key,
             machine,
             clock: Clock::new(),
             router: router.clone(),
@@ -566,5 +574,5 @@ pub(crate) fn spawn(
         }
         .run(actions),
     );
-    peer::Peer::new(config.public_key, router, status, session_rx, data_rx)
+    peer::Peer::new(peer_key, router, status, session_rx, data_rx)
 }

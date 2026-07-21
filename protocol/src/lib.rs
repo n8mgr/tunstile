@@ -5,10 +5,10 @@
 //! # Example
 //!
 //! ```
-//! use tunstile_protocol::{PrivateKey, PublicKey, peer::Peer};
+//! use tunstile_protocol::{Peer, PublicKey};
 //!
-//! fn new_peer(private_key: PrivateKey, public_key: PublicKey) -> Peer {
-//!     Peer::new(private_key, public_key)
+//! fn new_peer(public_key: PublicKey) -> Peer {
+//!     Peer::new(public_key)
 //! }
 //! ```
 
@@ -64,6 +64,7 @@ pub enum MessageHeaderParseError {
 
 /// The type and receiver index of a validated WireGuard message, parsed from
 /// its leading bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageHeader {
     HandshakeInit,
     HandshakeResponse { receiver: u32 },
@@ -114,8 +115,9 @@ pub mod handshake;
 pub mod peer;
 pub mod time;
 
-pub use keys::{KeyParseError, PrivateKey, PublicKey};
-pub use tai64::*;
+pub use keys::{KeyParseError, PresharedKey, PrivateKey, PublicKey};
+pub use peer::{HandshakeValues, Peer, PeerError, Recv};
+pub use tai64::Tai64N;
 use thiserror::Error;
 pub use x25519_dalek::ReusableSecret;
 

@@ -51,8 +51,8 @@ impl Peer {
     }
 
     /// This peer's public key.
-    pub fn public_key(&self) -> PublicKey {
-        self.public_key
+    pub fn public_key(&self) -> &PublicKey {
+        &self.public_key
     }
 
     /// Current status snapshot for this peer.
@@ -94,7 +94,7 @@ impl Peer {
     /// registration: dropping every sender does not remove the peer.
     pub fn sender(&self) -> PeerSender {
         PeerSender {
-            public_key: self.public_key,
+            public_key: self.public_key.clone(),
             router: self.router.clone(),
         }
     }
@@ -118,8 +118,8 @@ pub struct PeerSender {
 
 impl PeerSender {
     /// The peer's public key.
-    pub fn public_key(&self) -> PublicKey {
-        self.public_key
+    pub fn public_key(&self) -> &PublicKey {
+        &self.public_key
     }
 
     /// Sends a payload to the peer, staging it if no session is established yet.

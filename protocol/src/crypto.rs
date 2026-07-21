@@ -114,7 +114,6 @@ pub(crate) fn aead_open<'a>(
 /// Encrypts data using XChaCha20Poly1305 with a given nonce and authentication text
 /// The plain text is encrypted in place. `data` must be large enough to hold the 16 byte
 /// authentication tag.
-#[allow(unused)] // TODO: implement cookies
 pub(crate) fn xaead_seal(
     cipher: &XChaCha20Poly1305,
     nonce: [u8; 24],
@@ -131,7 +130,6 @@ pub(crate) fn xaead_seal(
 
 /// Decrypts data using XChaCha20Poly1305 with a given nonce and authentication text
 /// The cipher text is decrypted in place.
-#[allow(unused)] // TODO: implement cookies
 pub(crate) fn xaead_open(
     cipher: &XChaCha20Poly1305,
     nonce: [u8; 24],
@@ -186,7 +184,8 @@ mod test {
     #[test]
     fn kdf_vectors() {
         // taken from https://github.com/WireGuard/wireguard-go/blob/f333402bd9cbe0f3eeb02507bd14e23d7d639280/device/kdf_test.go#L29
-        let tests: &[(&[u8], &[u8], [u8; 32], [u8; 32], [u8; 32])] = &[
+        type KdfVector = (&'static [u8], &'static [u8], [u8; 32], [u8; 32], [u8; 32]);
+        let tests: &[KdfVector] = &[
             (
                 &[0x74, 0x65, 0x73, 0x74, 0x2d, 0x6b, 0x65, 0x79],
                 &[0x74, 0x65, 0x73, 0x74, 0x2d, 0x69, 0x6e, 0x70, 0x75, 0x74],
@@ -247,14 +246,14 @@ mod test {
         ];
 
         for (key, input, t0, t1, t2) in tests {
-            let [tt0] = kdf::<1>(&key, input);
+            let [tt0] = kdf::<1>(key, input);
             assert_eq!(tt0[..], t0[..], "kdf1");
 
-            let [tt0, tt1] = kdf::<2>(&key, input);
+            let [tt0, tt1] = kdf::<2>(key, input);
             assert_eq!(tt0[..], t0[..], "kdf2 tt0");
             assert_eq!(tt1[..], t1[..], "kdf2 tt1");
 
-            let [tt0, tt1, tt2] = kdf::<3>(&key, input);
+            let [tt0, tt1, tt2] = kdf::<3>(key, input);
             assert_eq!(tt0[..], t0[..], "kdf3 tt0");
             assert_eq!(tt1[..], t1[..], "kdf3 tt1");
             assert_eq!(tt2[..], t2[..], "kdf3 tt2");

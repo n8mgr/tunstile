@@ -19,10 +19,10 @@ tunstile_protocol = "0.0.1"
 ```
 
 ```rust
-use tunstile_protocol::{PrivateKey, PublicKey, peer::Peer};
+use tunstile_protocol::{Peer, PublicKey};
 
-fn new_peer(private_key: PrivateKey, public_key: PublicKey) -> Peer {
-    Peer::new(private_key, public_key)
+fn new_peer(public_key: PublicKey) -> Peer {
+    Peer::new(public_key)
 }
 ```
 

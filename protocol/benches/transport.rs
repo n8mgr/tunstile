@@ -15,13 +15,13 @@ fn complete_handshake() -> (Transport, Transport) {
     let sk2 = PrivateKey::from(rand::random::<[u8; 32]>());
     let pk2 = sk2.public_key();
 
-    let mut c_init = Generator::new(pk2);
-    let mut c_resp = Generator::new(pk1);
+    let mut c_init = Generator::new(&pk2);
+    let mut c_resp = Generator::new(&pk1);
 
     let mut init_buf = [0u8; INIT_MSG_LENGTH];
     let h_init = Handshake::initiate(
-        sk1,
-        pk2,
+        &sk1,
+        &pk2,
         100,
         ReusableSecret::random(),
         Tai64N::UNIX_EPOCH,
@@ -31,7 +31,7 @@ fn complete_handshake() -> (Transport, Transport) {
     .unwrap();
 
     let mut resp_buf = [0u8; RESP_MSG_LENGTH];
-    let h_resp = Handshake::receive(sk2, &mut init_buf)
+    let h_resp = Handshake::receive(&sk2, &mut init_buf)
         .expect("invalid init message")
         .respond(
             200,
@@ -44,7 +44,7 @@ fn complete_handshake() -> (Transport, Transport) {
         .unwrap();
 
     let h_init = h_init
-        .response_received(None, &mut resp_buf)
+        .response_received(&sk1, None, &mut resp_buf)
         .expect("invalid response received");
 
     (h_init.finish(), h_resp.finish())

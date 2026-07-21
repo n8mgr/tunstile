@@ -2,7 +2,7 @@ use clap::Parser;
 use etherparse::PacketBuilder;
 use std::{net::SocketAddr, time::Duration};
 use tokio::time::{Instant, interval, sleep_until};
-use tunstile_tunnel::{PrivateKey, PublicKey, Tunnel};
+use tunstile_tunnel::{PeerConfig, PrivateKey, PublicKey, Tunnel};
 
 /// Exercises a tunstile tunnel against a reference WireGuard peer
 /// (testutil/interop). Set RUST_LOG=debug for tunnel internals.
@@ -39,7 +39,16 @@ async fn main() {
     println!("rust public key: {}", args.key.public_key());
 
     let tunnel = Tunnel::new(args.bind, args.key.clone()).await.unwrap();
-    let mut peer = tunnel.connect_peer(args.peer, args.endpoint).await.unwrap();
+    let mut peer = tunnel
+        .add_peer(
+            &args.peer,
+            PeerConfig {
+                endpoint: Some(args.endpoint),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     println!("sent handshake init; waiting for handshake to complete");
     peer.ready().await.unwrap();
     println!("handshake complete");

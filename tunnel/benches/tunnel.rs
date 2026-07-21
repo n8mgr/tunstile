@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tokio::{runtime::Runtime, sync::Mutex};
-use tunstile_tunnel::{Bytes, Peer, PrivateKey, Tunnel};
+use tunstile_tunnel::{Bytes, Peer, PeerConfig, PrivateKey, Tunnel};
 
 const PAYLOAD_LEN: usize = 1420;
 const BATCH: usize = 256;
@@ -26,8 +26,20 @@ fn setup(rt: &Runtime) -> Established {
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
 
-        let peer_a = tunnel_b.allow_peer(pk_a).unwrap();
-        let peer_b = tunnel_a.connect_peer(pk_b, addr_b).await.unwrap();
+        let peer_a = tunnel_b
+            .add_peer(&pk_a, PeerConfig::default())
+            .await
+            .unwrap();
+        let peer_b = tunnel_a
+            .add_peer(
+                &pk_b,
+                PeerConfig {
+                    endpoint: Some(addr_b),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         peer_b.ready().await.unwrap();
 
         (

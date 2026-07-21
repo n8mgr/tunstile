@@ -27,7 +27,13 @@ async fn connect(
     let bind_addr = "0.0.0.0:0".parse()?;
     let tunnel = Tunnel::new(bind_addr, private_key).await?;
     let peer = tunnel
-        .add_peer(PeerConfig::new(peer_key).endpoint(endpoint))
+        .add_peer(
+            &peer_key,
+            PeerConfig {
+                endpoint: Some(endpoint),
+                ..Default::default()
+            },
+        )
         .await?;
 
     Ok((tunnel, peer))

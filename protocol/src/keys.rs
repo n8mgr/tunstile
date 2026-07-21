@@ -3,6 +3,7 @@ use core::{fmt, str::FromStr};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use thiserror::Error;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
+use zeroize::ZeroizeOnDrop;
 
 const KEY_BASE64_LEN: usize = 44;
 
@@ -37,7 +38,7 @@ fn fmt_key_base64(key: &[u8; 32], f: &mut fmt::Formatter<'_>) -> fmt::Result {
 
 /// A peer public key. Displays and parses as the standard WireGuard base64
 /// encoding.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, ZeroizeOnDrop, PartialEq, Eq, Hash)]
 pub struct PublicKey(pub(crate) XPublicKey);
 
 impl PublicKey {
@@ -81,7 +82,7 @@ impl fmt::Debug for PublicKey {
 
 /// A device private key. Parses from the standard WireGuard base64
 /// encoding; never printed by `Debug`.
-#[derive(Clone)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct PrivateKey(pub(crate) StaticSecret);
 
 impl PrivateKey {
@@ -126,6 +127,29 @@ impl FromStr for PrivateKey {
 impl fmt::Debug for PrivateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PrivateKey(…)")
+    }
+}
+
+#[derive(Clone, ZeroizeOnDrop, Default)]
+pub struct PresharedKey([u8; 32]);
+
+impl AsRef<[u8]> for PresharedKey {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl From<[u8; 32]> for PresharedKey {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl FromStr for PresharedKey {
+    type Err = KeyParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from(key_from_base64(s)?))
     }
 }
 

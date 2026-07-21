@@ -59,7 +59,7 @@ pub struct Generator {
 
 impl Generator {
     /// Creates a generator for handshakes addressed to `public_key`.
-    pub fn new(public_key: PublicKey) -> Self {
+    pub fn new(public_key: &PublicKey) -> Self {
         Self {
             mac1_key: hash(&[LABEL_MAC_1, public_key.as_bytes()]),
             cookie_key: hash(&[LABEL_COOKIE, public_key.as_bytes()]),
@@ -143,7 +143,7 @@ pub struct Verifier {
 
 impl Verifier {
     /// Creates a verifier for handshakes addressed to our own `public_key`.
-    pub fn new(public_key: PublicKey) -> Self {
+    pub fn new(public_key: &PublicKey) -> Self {
         Self {
             mac1_key: hash(&[LABEL_MAC_1, public_key.as_bytes()]),
             cookie_key: hash(&[LABEL_COOKIE, public_key.as_bytes()]),
@@ -227,8 +227,8 @@ mod test {
     fn cookie_round_trip() {
         // responder identity; the initiator addresses MACs to it
         let responder = PrivateKey::random().public_key();
-        let generator = &mut Generator::new(responder);
-        let checker = Verifier::new(responder);
+        let generator = &mut Generator::new(&responder);
+        let checker = Verifier::new(&responder);
 
         let now = Tai64N::UNIX_EPOCH;
         let source = b"203.0.113.7:51820";
@@ -265,8 +265,8 @@ mod test {
     #[test]
     fn cookie_reply_rejects_tampering() {
         let responder = PrivateKey::random().public_key();
-        let mut generator = Generator::new(responder);
-        let checker = Verifier::new(responder);
+        let mut generator = Generator::new(&responder);
+        let checker = Verifier::new(&responder);
         let now = Tai64N::UNIX_EPOCH;
 
         let mut msg = [0u8; INIT_MSG_LENGTH];
@@ -287,7 +287,7 @@ mod test {
     #[test]
     fn cookie_reply_requires_a_sent_handshake() {
         let responder = PrivateKey::random().public_key();
-        let mut generator = Generator::new(responder);
+        let mut generator = Generator::new(&responder);
         let mut reply = [0u8; COOKIE_REPLY_LENGTH];
         reply[0] = MessageType::Cookie as u8;
         assert_eq!(

@@ -1,16 +1,18 @@
 //! A user-space implementation of Wireguard using tunstile
 
 use std::{
-    fs,
+    fs, io,
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     time::Duration,
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use ipnet::IpNet;
-use tunstile::{Device, DeviceConfig, PeerConfig, PublicKey};
+use tun::{AbstractDevice, AsyncDevice};
+use tunstile::{Device, DeviceError, PeerConfig, PrivateKey, PublicKey};
 
 /// Bring up a WireGuard interface from a wg-quick style config file.
 #[derive(Parser)]
@@ -26,36 +28,38 @@ async fn main() {
 
     let text = fs::read_to_string(&args.config)
         .unwrap_or_else(|e| fail(format!("reading {}: {e}", args.config.display())));
-    let (config, peer_configs) = parse_config(&text)
+    let (listen_addr, private_key, tun_config, peer_configs) = parse_config(&text)
         .unwrap_or_else(|e| fail(format!("parsing {}: {e}", args.config.display())));
 
-    println!("public key: {}", config.public_key());
-    let device = Device::new(config)
+    println!("public key: {}", private_key.public_key());
+    let device = Device::new(listen_addr, private_key)
         .await
+        .unwrap_or_else(|e| fail(format!("creating device: {e}")));
+    let packets = TunPackets::new(&tun_config)
         .unwrap_or_else(|e| fail(format!("bringing up interface: {e}")));
-    let tun_name = device
+    let tun_name = packets
         .tun_name()
         .unwrap_or_else(|| fail("interface has no name".into()));
 
-    // hold the peer handles for the lifetime of the process; dropping one
-    // would unregister that peer
-    let mut peers = Vec::new();
-    for peer in peer_configs {
-        let key = peer.public_key();
-        let allowed_ips = peer.allowed_ips().to_vec();
-        peers.push(
-            device
-                .add_peer(peer)
-                .await
-                .unwrap_or_else(|e| fail(format!("adding peer {key}: {e}"))),
-        );
+    let peer_count = peer_configs.len();
+    for (key, peer) in peer_configs {
+        let allowed_ips = peer.allowed_ips.clone();
+        device
+            .add_peer(&key, peer)
+            .await
+            .unwrap_or_else(|e| fail(format!("adding peer {key}: {e}")));
         add_routes(&tun_name, &allowed_ips)
             .unwrap_or_else(|e| fail(format!("routing peer {key}: {e}")));
     }
-    println!("{tun_name} up with {} peer(s); ctrl-c to stop", peers.len());
+    println!("{tun_name} up with {peer_count} peer(s); ctrl-c to stop");
 
-    let _ = tokio::signal::ctrl_c().await;
-    println!("shutting down");
+    tokio::select! {
+        result = run_packets(&device, &packets) => match result {
+            Ok(()) => println!("packet interface closed"),
+            Err(error) => fail(format!("packet interface: {error}")),
+        },
+        _ = tokio::signal::ctrl_c() => println!("shutting down"),
+    }
 }
 
 fn fail(msg: String) -> ! {
@@ -64,7 +68,7 @@ fn fail(msg: String) -> ! {
 }
 
 #[derive(Default)]
-struct PeerAcc {
+struct PeerSection {
     public_key: Option<PublicKey>,
     endpoint: Option<SocketAddr>,
     preshared_key: Option<[u8; 32]>,
@@ -72,13 +76,87 @@ struct PeerAcc {
     allowed_ips: Vec<IpNet>,
 }
 
-fn parse_config(text: &str) -> Result<(DeviceConfig, Vec<PeerConfig>), String> {
+struct TunConfig {
+    address: IpNet,
+    mtu: u16,
+}
+
+struct TunPackets {
+    tun: AsyncDevice,
+    mtu: usize,
+}
+
+impl TunPackets {
+    fn new(config: &TunConfig) -> io::Result<Self> {
+        let mut tun_config = tun::Configuration::default();
+        tun_config
+            .address(config.address.addr())
+            .netmask(config.address.netmask())
+            .mtu(config.mtu)
+            .up();
+        let tun = tun::create_as_async(&tun_config).map_err(io::Error::from)?;
+        Ok(Self {
+            tun,
+            mtu: config.mtu as usize,
+        })
+    }
+
+    fn tun_name(&self) -> Option<String> {
+        self.tun.tun_name().ok().filter(|name| !name.is_empty())
+    }
+
+    async fn recv(&self) -> io::Result<Bytes> {
+        let mut packet = BytesMut::with_capacity(self.mtu);
+        packet.resize(self.mtu, 0);
+        let len = self.tun.recv(&mut packet).await?;
+        packet.truncate(len);
+        Ok(packet.freeze())
+    }
+
+    async fn send(&self, packet: Bytes) -> io::Result<()> {
+        self.tun.send(&packet).await.map(|_| ())
+    }
+}
+
+async fn run_packets(device: &Device, packets: &TunPackets) -> Result<(), DeviceError> {
+    let recv = packets.recv();
+    tokio::pin!(recv);
+    loop {
+        tokio::select! {
+            packet = &mut recv => {
+                match device.send_packet(packet?).await {
+                    Ok(()) => {}
+                    Err(error @ (DeviceError::InvalidPacket | DeviceError::NoPeer(_))) => {
+                        log::debug!("dropping outbound packet: {error}");
+                    }
+                    Err(error) => return Err(error),
+                }
+                recv.set(packets.recv());
+            }
+            packet = device.recv_packet() => {
+                let Some(packet) = packet else {
+                    return Ok(());
+                };
+                packets.send(packet).await?;
+            }
+        }
+    }
+}
+
+type ParsedConfig = (
+    SocketAddr,
+    PrivateKey,
+    TunConfig,
+    Vec<(PublicKey, PeerConfig)>,
+);
+
+fn parse_config(text: &str) -> Result<ParsedConfig, String> {
     let mut section = String::new();
     let mut private_key = None;
     let mut address = None;
     let mut listen_port: u16 = 51820;
     let mut mtu = None;
-    let mut peers: Vec<PeerAcc> = Vec::new();
+    let mut peers: Vec<PeerSection> = Vec::new();
 
     for (i, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap().trim();
@@ -90,7 +168,7 @@ fn parse_config(text: &str) -> Result<(DeviceConfig, Vec<PeerConfig>), String> {
         if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             section = name.trim().to_ascii_lowercase();
             if section == "peer" {
-                peers.push(PeerAcc::default());
+                peers.push(PeerSection::default());
             }
             continue;
         }
@@ -154,30 +232,26 @@ fn parse_config(text: &str) -> Result<(DeviceConfig, Vec<PeerConfig>), String> {
 
     let private_key = private_key.ok_or("[Interface] missing PrivateKey")?;
     let address = address.ok_or("[Interface] missing Address")?;
-    let mut config = DeviceConfig::new(private_key, address)
-        .listen_addr(SocketAddr::from(([0, 0, 0, 0], listen_port)));
-    if let Some(mtu) = mtu {
-        config = config.mtu(mtu);
-    }
+    let listen_addr = SocketAddr::from(([0, 0, 0, 0], listen_port));
+    let tun_config = TunConfig {
+        address,
+        mtu: mtu.unwrap_or(1420),
+    };
 
     let mut peer_configs = Vec::new();
-    for acc in peers {
-        let mut peer = PeerConfig::new(acc.public_key.ok_or("[Peer] missing PublicKey")?);
-        if let Some(endpoint) = acc.endpoint {
-            peer = peer.endpoint(endpoint);
-        }
-        if let Some(psk) = acc.preshared_key {
-            peer = peer.preshared_key(psk);
-        }
-        if let Some(secs) = acc.keepalive {
-            peer = peer.persistent_keepalive(Duration::from_secs(secs));
-        }
-        for net in acc.allowed_ips {
-            peer = peer.allowed_ip(net);
-        }
-        peer_configs.push(peer);
+    for peer in peers {
+        let public_key = peer.public_key.ok_or("[Peer] missing PublicKey")?;
+        peer_configs.push((
+            public_key,
+            PeerConfig {
+                endpoint: peer.endpoint,
+                preshared_key: peer.preshared_key,
+                persistent_keepalive: peer.keepalive.map(Duration::from_secs),
+                allowed_ips: peer.allowed_ips,
+            },
+        ));
     }
-    Ok((config, peer_configs))
+    Ok((listen_addr, private_key, tun_config, peer_configs))
 }
 
 fn decode_key(s: &str) -> Result<[u8; 32], ()> {

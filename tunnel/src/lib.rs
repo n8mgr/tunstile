@@ -15,7 +15,13 @@
 //! ) -> Result<(Tunnel, Peer), Box<dyn Error>> {
 //!     let tunnel = Tunnel::new("0.0.0.0:0".parse()?, private_key).await?;
 //!     let peer = tunnel
-//!         .add_peer(PeerConfig::new(peer_key).endpoint(endpoint))
+//!         .add_peer(
+//!             &peer_key,
+//!             PeerConfig {
+//!                 endpoint: Some(endpoint),
+//!                 ..Default::default()
+//!             },
+//!         )
 //!         .await?;
 //!     Ok((tunnel, peer))
 //! }
@@ -69,43 +75,17 @@ pub enum RegisterError {
     AlreadyRegistered,
 }
 
-/// Configuration for registering a peer.
-#[derive(Debug, Clone)]
+/// Optional settings for a peer.
+#[derive(Debug, Clone, Default)]
 pub struct PeerConfig {
-    pub(crate) public_key: PublicKey,
-    pub(crate) endpoint: Option<SocketAddr>,
-    pub(crate) preshared_key: Option<[u8; 32]>,
-    pub(crate) persistent_keepalive: Option<Duration>,
-}
+    /// The peer's initial endpoint.
+    pub endpoint: Option<SocketAddr>,
 
-impl PeerConfig {
-    /// A config for the peer with the given public key and no other options.
-    pub fn new(public_key: PublicKey) -> Self {
-        Self {
-            public_key,
-            endpoint: None,
-            preshared_key: None,
-            persistent_keepalive: None,
-        }
-    }
+    /// The optional pre-shared key.
+    pub preshared_key: Option<[u8; 32]>,
 
-    /// Sets the peer's initial endpoint.
-    pub fn endpoint(mut self, endpoint: SocketAddr) -> Self {
-        self.endpoint = Some(endpoint);
-        self
-    }
-
-    /// Sets the optional pre-shared key.
-    pub fn preshared_key(mut self, preshared_key: [u8; 32]) -> Self {
-        self.preshared_key = Some(preshared_key);
-        self
-    }
-
-    /// Sets the persistent keepalive interval.
-    pub fn persistent_keepalive(mut self, interval: Duration) -> Self {
-        self.persistent_keepalive = Some(interval);
-        self
-    }
+    /// The persistent keepalive interval.
+    pub persistent_keepalive: Option<Duration>,
 }
 
 /// A point-in-time snapshot of a peer's endpoint, traffic counters, and
@@ -129,14 +109,18 @@ pub struct PeerStatus {
 /// # Example
 ///
 /// ```no_run
-/// use tunstile_tunnel::{PrivateKey, Tunnel};
+/// use tunstile_tunnel::{PeerConfig, PrivateKey, Tunnel};
 ///
 /// # async fn connect() -> Result<(), Box<dyn std::error::Error>> {
 /// let tunnel = Tunnel::new("0.0.0.0:0".parse()?, PrivateKey::random()).await?;
+/// let peer_key = "jrpP5X9mNSxjkd6tCnHwdRI4Rp8ZnquQj34UAqlZpx8=".parse()?;
 /// let mut peer = tunnel
-///     .connect_peer(
-///         "jrpP5X9mNSxjkd6tCnHwdRI4Rp8ZnquQj34UAqlZpx8=".parse()?,
-///         "203.0.113.1:51820".parse()?,
+///     .add_peer(
+///         &peer_key,
+///         PeerConfig {
+///             endpoint: Some("203.0.113.1:51820".parse()?),
+///             ..Default::default()
+///         },
 ///     )
 ///     .await?;
 ///
@@ -146,7 +130,7 @@ pub struct PeerStatus {
 /// # }
 /// ```
 pub struct Tunnel {
-    our_key: PrivateKey,
+    our_key: Arc<PrivateKey>,
     socket: Arc<UdpSocket>,
     router: Arc<RoutingTable>,
     // only the read loop's clone is read in production; the tunnel keeps a
@@ -164,13 +148,13 @@ impl Drop for Tunnel {
 
 impl Tunnel {
     async fn read_loop(
-        our_private: PrivateKey,
+        our_private: Arc<PrivateKey>,
         socket: Arc<UdpSocket>,
         router: Arc<RoutingTable>,
         under_load: Arc<AtomicBool>,
     ) {
         let clock = Clock::new();
-        let mut guard = LoadGuard::new(our_private.public_key(), rand::random());
+        let mut guard = LoadGuard::new(&our_private.public_key(), rand::random());
         let mut secret_rotated = clock.now();
         let mut bufs = vec![vec![0u8; MAX_MESSAGE_SIZE]; BATCH_SIZE];
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
@@ -224,7 +208,7 @@ impl Tunnel {
                     }
                     match header {
                         MessageHeader::HandshakeInit => {
-                            match Handshake::receive(our_private.clone(), segment) {
+                            match Handshake::receive(&our_private, segment) {
                                 Ok(handshake) => {
                                     let _ = router.recv_handshake_init(meta.addr, handshake).await;
                                 }
@@ -255,13 +239,18 @@ impl Tunnel {
         }
     }
 
-    fn register_peer(&self, config: &PeerConfig) -> Result<Peer, RegisterError> {
+    fn register_peer(
+        &self,
+        public_key: &PublicKey,
+        config: &PeerConfig,
+    ) -> Result<Peer, RegisterError> {
         let (actions, status) = self
             .router
-            .register_peer(config.public_key)
+            .register_peer(public_key.clone())
             .ok_or(RegisterError::AlreadyRegistered)?;
         Ok(actor::spawn(
             self.our_key.clone(),
+            public_key.clone(),
             config,
             Arc::downgrade(&self.router),
             self.socket.clone(),
@@ -272,28 +261,21 @@ impl Tunnel {
 
     /// Registers a peer and returns its handle, initiating a handshake if the
     /// config carries an endpoint. Errors if the peer is already registered.
-    pub async fn add_peer(&self, config: PeerConfig) -> Result<Peer, RegisterError> {
-        let peer = self.register_peer(&config)?;
+    pub async fn add_peer(
+        &self,
+        public_key: &PublicKey,
+        config: PeerConfig,
+    ) -> Result<Peer, RegisterError> {
+        let peer = self.register_peer(public_key, &config)?;
         if let Some(endpoint) = config.endpoint {
-            let _ = self.router.connect(&config.public_key, endpoint).await;
+            let _ = self.router.connect(peer.public_key(), endpoint).await;
         }
         Ok(peer)
     }
 
-    /// Registers a peer with no endpoint; it can only respond to inbound
-    /// handshakes until [`Peer::connect`] gives it one.
-    pub fn allow_peer(&self, peer_key: PublicKey) -> Result<Peer, RegisterError> {
-        self.register_peer(&PeerConfig::new(peer_key))
-    }
-
-    /// Registers a peer with an endpoint and initiates a handshake.
-    pub async fn connect_peer(
-        &self,
-        peer_key: PublicKey,
-        endpoint: SocketAddr,
-    ) -> Result<Peer, RegisterError> {
-        self.add_peer(PeerConfig::new(peer_key).endpoint(endpoint))
-            .await
+    /// This tunnel's public key.
+    pub fn public_key(&self) -> PublicKey {
+        self.our_key.public_key()
     }
 
     /// The local UDP address the tunnel is bound to.
@@ -345,6 +327,7 @@ impl Tunnel {
         let socket = Arc::new(socket);
         let router = Arc::new(RoutingTable::new());
         let under_load = Arc::new(AtomicBool::new(false));
+        let our_key = Arc::new(our_key);
         let read_task = spawn(Self::read_loop(
             our_key.clone(),
             socket.clone(),
@@ -385,12 +368,13 @@ mod tests {
     async fn starts_with_existing_socket() {
         let socket = std::net::UdpSocket::bind(loopback()).unwrap();
         let local_addr = socket.local_addr().unwrap();
+        let private_key = PrivateKey::random();
+        let public_key = private_key.public_key();
 
-        let tunnel = Tunnel::from_socket(socket, PrivateKey::random())
-            .await
-            .unwrap();
+        let tunnel = Tunnel::from_socket(socket, private_key).await.unwrap();
 
         assert_eq!(tunnel.local_addr().unwrap(), local_addr);
+        assert_eq!(tunnel.public_key(), public_key);
     }
 
     // The responder is forced under load, so the initiator's first handshake is
@@ -408,8 +392,20 @@ mod tests {
         let addr_b = tunnel_b.local_addr().unwrap();
         tunnel_b.force_under_load();
 
-        let mut peer_a = tunnel_b.allow_peer(pk_a).unwrap();
-        let peer_b = tunnel_a.connect_peer(pk_b, addr_b).await.unwrap();
+        let mut peer_a = tunnel_b
+            .add_peer(&pk_a, PeerConfig::default())
+            .await
+            .unwrap();
+        let peer_b = tunnel_a
+            .add_peer(
+                &pk_b,
+                PeerConfig {
+                    endpoint: Some(addr_b),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         tokio::time::timeout(Duration::from_secs(7), peer_b.ready())
             .await
@@ -437,8 +433,20 @@ mod tests {
         let addr_b = tunnel_b.local_addr().unwrap();
 
         // b is the responder; a initiates the handshake.
-        let mut peer_a = tunnel_b.allow_peer(pk_a).unwrap();
-        let mut peer_b = tunnel_a.connect_peer(pk_b, addr_b).await.unwrap();
+        let mut peer_a = tunnel_b
+            .add_peer(&pk_a, PeerConfig::default())
+            .await
+            .unwrap();
+        let mut peer_b = tunnel_a
+            .add_peer(
+                &pk_b,
+                PeerConfig {
+                    endpoint: Some(addr_b),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         peer_b.ready().await.unwrap();
         peer_a.ready().await.unwrap();
@@ -499,8 +507,20 @@ mod tests {
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
 
-        let mut peer_a = tunnel_b.allow_peer(pk_a).unwrap();
-        let peer_b = tunnel_a.connect_peer(pk_b, addr_b).await.unwrap();
+        let mut peer_a = tunnel_b
+            .add_peer(&pk_a, PeerConfig::default())
+            .await
+            .unwrap();
+        let peer_b = tunnel_a
+            .add_peer(
+                &pk_b,
+                PeerConfig {
+                    endpoint: Some(addr_b),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         // no readiness wait: the payload stages until the handshake completes
         let payload = b"staged before handshake".to_vec();
@@ -526,12 +546,24 @@ mod tests {
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
 
-        let peer_a = tunnel_b.allow_peer(pk_a).unwrap();
+        let peer_a = tunnel_b
+            .add_peer(&pk_a, PeerConfig::default())
+            .await
+            .unwrap();
         let payload = b"staged before endpoint".to_vec();
         peer_a.send(payload.clone()).await.unwrap();
         assert!(peer_a.status().last_send.is_none());
 
-        let mut peer_b = tunnel_a.connect_peer(pk_b, addr_b).await.unwrap();
+        let mut peer_b = tunnel_a
+            .add_peer(
+                &pk_b,
+                PeerConfig {
+                    endpoint: Some(addr_b),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         let data = tokio::time::timeout(Duration::from_secs(5), peer_b.recv())
             .await
@@ -549,7 +581,10 @@ mod tests {
         let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
-        let mut peer_b = tunnel_a.allow_peer(pk_b).unwrap();
+        let mut peer_b = tunnel_a
+            .add_peer(&pk_b, PeerConfig::default())
+            .await
+            .unwrap();
         drop(tunnel_a);
 
         let closed = tokio::time::timeout(Duration::from_secs(2), peer_b.recv())
@@ -569,16 +604,22 @@ mod tests {
         let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
-        let peer_b = tunnel_a.allow_peer(pk_b).unwrap();
+        let peer_b = tunnel_a
+            .add_peer(&pk_b, PeerConfig::default())
+            .await
+            .unwrap();
         assert_eq!(
-            tunnel_a.allow_peer(pk_b).err(),
+            tunnel_a.add_peer(&pk_b, PeerConfig::default()).await.err(),
             Some(RegisterError::AlreadyRegistered)
         );
 
         // dropping the handle unregisters the peer and frees the key
         drop(peer_b);
         assert!(tunnel_a.peer(&pk_b).is_none());
-        let _peer_b = tunnel_a.allow_peer(pk_b).unwrap();
+        let _peer_b = tunnel_a
+            .add_peer(&pk_b, PeerConfig::default())
+            .await
+            .unwrap();
         assert!(tunnel_a.peer(&pk_b).is_some());
     }
 
@@ -595,11 +636,24 @@ mod tests {
         let addr_b = tunnel_b.local_addr().unwrap();
 
         let mut peer_a = tunnel_b
-            .add_peer(PeerConfig::new(pk_a).preshared_key(psk))
+            .add_peer(
+                &pk_a,
+                PeerConfig {
+                    preshared_key: Some(psk),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let peer_b = tunnel_a
-            .add_peer(PeerConfig::new(pk_b).endpoint(addr_b).preshared_key(psk))
+            .add_peer(
+                &pk_b,
+                PeerConfig {
+                    endpoint: Some(addr_b),
+                    preshared_key: Some(psk),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -631,14 +685,23 @@ mod tests {
         let addr_b = tunnel_b.local_addr().unwrap();
 
         let _peer_a = tunnel_b
-            .add_peer(PeerConfig::new(pk_a).preshared_key([1u8; 32]))
+            .add_peer(
+                &pk_a,
+                PeerConfig {
+                    preshared_key: Some([1u8; 32]),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let peer_b = tunnel_a
             .add_peer(
-                PeerConfig::new(pk_b)
-                    .endpoint(addr_b)
-                    .preshared_key([2u8; 32]),
+                &pk_b,
+                PeerConfig {
+                    endpoint: Some(addr_b),
+                    preshared_key: Some([2u8; 32]),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -663,12 +726,18 @@ mod tests {
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
 
-        let peer_a = tunnel_b.allow_peer(pk_a).unwrap();
+        let peer_a = tunnel_b
+            .add_peer(&pk_a, PeerConfig::default())
+            .await
+            .unwrap();
         let peer_b = tunnel_a
             .add_peer(
-                PeerConfig::new(pk_b)
-                    .endpoint(addr_b)
-                    .persistent_keepalive(Duration::from_millis(100)),
+                &pk_b,
+                PeerConfig {
+                    endpoint: Some(addr_b),
+                    persistent_keepalive: Some(Duration::from_millis(100)),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();

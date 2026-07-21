@@ -13,8 +13,8 @@ fn bench_handshake(c: &mut Criterion) {
     let sk2 = PrivateKey::from(rand::random::<[u8; 32]>());
     let pk2 = sk2.public_key();
 
-    let mut c_init = Generator::new(pk2);
-    let mut c_resp = Generator::new(pk1);
+    let mut c_init = Generator::new(&pk2);
+    let mut c_resp = Generator::new(&pk1);
 
     c.bench_function("handshake_e2e", |b| {
         b.iter_batched(
@@ -22,8 +22,8 @@ fn bench_handshake(c: &mut Criterion) {
             |(hs_init, hs_resp)| {
                 let mut init_buf = [0u8; INIT_MSG_LENGTH];
                 let h_init = Handshake::initiate(
-                    sk1.clone(),
-                    pk2,
+                    &sk1,
+                    &pk2,
                     100,
                     hs_init,
                     Tai64N::UNIX_EPOCH,
@@ -33,7 +33,7 @@ fn bench_handshake(c: &mut Criterion) {
                 .unwrap();
 
                 let mut resp_buf = [0u8; RESP_MSG_LENGTH];
-                let h_resp = Handshake::receive(sk2.clone(), &mut init_buf)
+                let h_resp = Handshake::receive(&sk2, &mut init_buf)
                     .expect("receive failed")
                     .respond(
                         200,
@@ -46,7 +46,7 @@ fn bench_handshake(c: &mut Criterion) {
                     .unwrap();
 
                 let h_init = h_init
-                    .response_received(None, &mut resp_buf)
+                    .response_received(&sk1, None, &mut resp_buf)
                     .expect("response_received failed");
 
                 let _t_init = h_init.finish();

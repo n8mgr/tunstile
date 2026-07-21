@@ -20,6 +20,7 @@ use tai64::Tai64N;
 use thiserror::Error;
 use x25519_dalek::ReusableSecret;
 
+use crate::keys::PresharedKey;
 use crate::{
     MessageHeader,
     cookies::{COOKIE_REPLY_LENGTH, Generator, Verifier},
@@ -145,18 +146,19 @@ struct PendingHandshake {
 /// output buffer for each handshake attempt:
 ///
 /// ```
-/// use tunstile_protocol::{PrivateKey, ReusableSecret, Tai64N};
+/// use tunstile_protocol::handshake::INIT_MSG_LENGTH;
 /// use tunstile_protocol::{
-///     handshake::INIT_MSG_LENGTH,
-///     peer::{HandshakeValues, Peer, PeerError},
+///     HandshakeValues, Peer, PeerError, PrivateKey, ReusableSecret, Tai64N,
 /// };
 ///
 /// fn write_initiation(
+///     private_key: &PrivateKey,
 ///     peer: &mut Peer,
 ///     ephemeral_secret: ReusableSecret,
 /// ) -> Result<[u8; INIT_MSG_LENGTH], PeerError> {
 ///     let mut packet = [0u8; INIT_MSG_LENGTH];
 ///     peer.initiate(
+///         private_key,
 ///         HandshakeValues {
 ///             index: 1,
 ///             ephemeral_secret,
@@ -167,24 +169,21 @@ struct PendingHandshake {
 ///     Ok(packet)
 /// }
 ///
-/// let mut peer = Peer::new(
-///     PrivateKey::from([1u8; 32]),
-///     PrivateKey::from([2u8; 32]).public_key(),
-/// );
+/// let private_key = PrivateKey::from([1u8; 32]);
+/// let mut peer = Peer::new(PrivateKey::from([2u8; 32]).public_key());
 /// peer.set_endpoint("203.0.113.1:51820".parse().unwrap());
 ///
 /// // Supply a CSPRNG-generated `ReusableSecret`, send the returned packet to
 /// // `peer.endpoint()`, and schedule a retry if needed.
-/// # let _ = (&mut peer, write_initiation);
+/// # let _ = (&private_key, &mut peer, write_initiation);
 /// ```
 pub struct Peer {
-    our_key: PrivateKey,
     peer_key: PublicKey,
     endpoint: Option<SocketAddr>,
 
     cookie_generator: Generator,
 
-    preshared_key: Option<[u8; 32]>,
+    preshared_key: Option<PresharedKey>,
     last_handshake_timestamp: Option<Tai64N>,
 
     pending: Option<PendingHandshake>,
@@ -199,12 +198,12 @@ pub struct Peer {
 impl Peer {
     /// A peer with no endpoint; it can only respond to inbound handshakes
     /// until [`Peer::set_endpoint`] gives it one.
-    pub fn new(our_key: PrivateKey, peer_key: PublicKey) -> Self {
+    pub fn new(peer_key: PublicKey) -> Self {
+        let cookie_generator = Generator::new(&peer_key);
         Self {
-            our_key,
             peer_key,
             endpoint: None,
-            cookie_generator: Generator::new(peer_key),
+            cookie_generator,
             preshared_key: None,
             last_handshake_timestamp: None,
             pending: None,
@@ -215,14 +214,14 @@ impl Peer {
     }
 
     /// Sets the optional pre-shared key.
-    pub fn preshared_key(mut self, preshared_key: [u8; 32]) -> Self {
+    pub fn preshared_key(mut self, preshared_key: PresharedKey) -> Self {
         self.preshared_key = Some(preshared_key);
         self
     }
 
     /// The peer's public key.
-    pub fn peer_key(&self) -> PublicKey {
-        self.peer_key
+    pub fn peer_key(&self) -> &PublicKey {
+        &self.peer_key
     }
 
     /// The address outbound packets are sent to, updated to the source of
@@ -245,6 +244,7 @@ impl Peer {
     /// up.
     pub fn initiate(
         &mut self,
+        our_key: &PrivateKey,
         values: HandshakeValues,
         out: &mut [u8],
     ) -> Result<Option<u32>, PeerError> {
@@ -254,8 +254,8 @@ impl Peer {
             });
         }
         let state = Handshake::initiate(
-            self.our_key.clone(),
-            self.peer_key,
+            our_key,
+            &self.peer_key,
             values.index,
             values.ephemeral_secret,
             values.timestamp,
@@ -309,7 +309,7 @@ impl Peer {
             .respond(
                 values.index,
                 values.ephemeral_secret,
-                self.preshared_key,
+                self.preshared_key.as_ref(),
                 values.timestamp,
                 &mut self.cookie_generator,
                 out,
@@ -332,6 +332,7 @@ impl Peer {
     /// (and its retransmit schedule) intact.
     pub fn handshake_response(
         &mut self,
+        our_key: &PrivateKey,
         now: Instant,
         packet: &mut [u8],
         source: SocketAddr,
@@ -341,8 +342,7 @@ impl Peer {
         };
         let established = pending
             .state
-            .clone()
-            .response_received(self.preshared_key, packet)
+            .response_received_ref(our_key, self.preshared_key.as_ref(), packet)
             .map_err(|_| PeerError::Handshake)?;
         self.pending = None;
         Ok(self.adopt_current(Session::new(established.finish(), now), source))
@@ -467,7 +467,7 @@ pub struct LoadGuard {
 impl LoadGuard {
     /// A guard for handshakes addressed to `our_public`, with an initial
     /// cookie secret.
-    pub fn new(our_public: PublicKey, secret: [u8; 32]) -> Self {
+    pub fn new(our_public: &PublicKey, secret: [u8; 32]) -> Self {
         Self {
             verifier: Verifier::new(our_public),
             secret,
@@ -574,22 +574,22 @@ mod tests {
     fn established_pair(now: Instant) -> (Peer, Peer) {
         let a_key = PrivateKey::random();
         let b_key = PrivateKey::random();
-        let mut a = Peer::new(a_key.clone(), b_key.public_key());
-        let mut b = Peer::new(b_key.clone(), a_key.public_key());
+        let mut a = Peer::new(b_key.public_key());
+        let mut b = Peer::new(a_key.public_key());
 
         a.set_endpoint(addr(2));
         let mut init = [0u8; handshake::INIT_MSG_LENGTH];
-        let replaced = a.initiate(values(1), &mut init).unwrap();
+        let replaced = a.initiate(&a_key, values(1), &mut init).unwrap();
         assert_eq!(replaced, None);
 
-        let hs = Handshake::receive(b_key, &mut init).expect("valid init");
+        let hs = Handshake::receive(&b_key, &mut init).expect("valid init");
         let mut resp = [0u8; handshake::RESP_MSG_LENGTH];
         let displaced = b.respond(now, hs, values(2), addr(1), &mut resp).unwrap();
         assert_eq!(displaced, None);
         assert_eq!(b.endpoint(), Some(addr(1)));
 
         let retired = a
-            .handshake_response(now, &mut resp, addr(2))
+            .handshake_response(&a_key, now, &mut resp, addr(2))
             .expect("valid response");
         assert_eq!(retired, None);
 
@@ -680,21 +680,21 @@ mod tests {
     fn initiate_replaces_pending() {
         let a_key = PrivateKey::random();
         let b_key = PrivateKey::random();
-        let mut a = Peer::new(a_key, b_key.public_key());
+        let mut a = Peer::new(b_key.public_key());
         a.set_endpoint(addr(2));
 
         let mut short = [0u8; handshake::INIT_MSG_LENGTH - 1];
         assert_eq!(
-            a.initiate(values(6), &mut short),
+            a.initiate(&a_key, values(6), &mut short),
             Err(PeerError::BufferTooSmall {
                 required: handshake::INIT_MSG_LENGTH,
             })
         );
 
         let mut init = [0u8; handshake::INIT_MSG_LENGTH];
-        assert_eq!(a.initiate(values(7), &mut init), Ok(None));
+        assert_eq!(a.initiate(&a_key, values(7), &mut init), Ok(None));
         // a retransmit is a fresh initiation; the old index is retired
-        assert_eq!(a.initiate(values(8), &mut init), Ok(Some(7)));
+        assert_eq!(a.initiate(&a_key, values(8), &mut init), Ok(Some(7)));
         assert_eq!(a.abandon_handshake(), Some(8));
         assert_eq!(a.abandon_handshake(), None);
     }
@@ -704,20 +704,20 @@ mod tests {
         let now = ms(0);
         let a_key = PrivateKey::random();
         let b_key = PrivateKey::random();
-        let mut a = Peer::new(a_key.clone(), b_key.public_key());
-        let mut b = Peer::new(b_key.clone(), a_key.public_key());
+        let mut a = Peer::new(b_key.public_key());
+        let mut b = Peer::new(a_key.public_key());
         a.set_endpoint(addr(2));
 
         let mut first = [0u8; handshake::INIT_MSG_LENGTH];
-        a.initiate(values(1), &mut first).unwrap();
-        let first = Handshake::receive(b_key.clone(), &mut first).unwrap();
+        a.initiate(&a_key, values(1), &mut first).unwrap();
+        let first = Handshake::receive(&b_key, &mut first).unwrap();
         let mut response = [0u8; handshake::RESP_MSG_LENGTH];
         b.respond(now, first, values(2), addr(1), &mut response)
             .unwrap();
 
         let mut replay = [0u8; handshake::INIT_MSG_LENGTH];
-        a.initiate(values(3), &mut replay).unwrap();
-        let replay = Handshake::receive(b_key, &mut replay).unwrap();
+        a.initiate(&a_key, values(3), &mut replay).unwrap();
+        let replay = Handshake::receive(&b_key, &mut replay).unwrap();
         assert_eq!(
             b.respond(now, replay, values(4), addr(1), &mut response,)
                 .err(),
@@ -732,12 +732,12 @@ mod tests {
         let now = ms(0);
         let a_key = PrivateKey::random();
         let b_key = PrivateKey::random();
-        let mut a = Peer::new(a_key, b_key.public_key());
-        let mut guard = LoadGuard::new(b_key.public_key(), [42u8; 32]);
+        let mut a = Peer::new(b_key.public_key());
+        let mut guard = LoadGuard::new(&b_key.public_key(), [42u8; 32]);
         a.set_endpoint(addr(2));
 
         let mut init = [0u8; handshake::INIT_MSG_LENGTH];
-        a.initiate(values(1), &mut init).unwrap();
+        a.initiate(&a_key, values(1), &mut init).unwrap();
         let reply = match guard.check(now, &init, addr(1), [7u8; 24], true) {
             HandshakeDecision::Cookie(reply) => reply,
             _ => panic!("expected a cookie challenge"),
@@ -745,7 +745,7 @@ mod tests {
 
         a.cookie_reply(&reply, Tai64N::UNIX_EPOCH)
             .expect("valid cookie reply");
-        a.initiate(values(2), &mut init).unwrap();
+        a.initiate(&a_key, values(2), &mut init).unwrap();
         assert!(matches!(
             guard.check(now, &init, addr(1), [8u8; 24], true),
             HandshakeDecision::Process
@@ -757,14 +757,14 @@ mod tests {
         let now = ms(0);
         let a_key = PrivateKey::random();
         let b_key = PrivateKey::random();
-        let mut a = Peer::new(a_key.clone(), b_key.public_key());
-        let mut b = Peer::new(b_key.clone(), a_key.public_key());
-        let mut guard = LoadGuard::new(a_key.public_key(), [42u8; 32]);
+        let mut a = Peer::new(b_key.public_key());
+        let mut b = Peer::new(a_key.public_key());
+        let mut guard = LoadGuard::new(&a_key.public_key(), [42u8; 32]);
         a.set_endpoint(addr(2));
 
         let mut init = [0u8; handshake::INIT_MSG_LENGTH];
-        a.initiate(values(1), &mut init).unwrap();
-        let received = Handshake::receive(b_key.clone(), &mut init).unwrap();
+        a.initiate(&a_key, values(1), &mut init).unwrap();
+        let received = Handshake::receive(&b_key, &mut init).unwrap();
         let mut response = [0u8; handshake::RESP_MSG_LENGTH];
         b.respond(now, received, values(2), addr(1), &mut response)
             .unwrap();
@@ -778,6 +778,7 @@ mod tests {
 
         let later = Tai64N::UNIX_EPOCH + Duration::from_secs(1);
         a.initiate(
+            &a_key,
             HandshakeValues {
                 index: 3,
                 ephemeral_secret: ReusableSecret::random(),
@@ -786,7 +787,7 @@ mod tests {
             &mut init,
         )
         .unwrap();
-        let received = Handshake::receive(b_key, &mut init).unwrap();
+        let received = Handshake::receive(&b_key, &mut init).unwrap();
         b.respond(
             now,
             received,

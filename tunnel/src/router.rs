@@ -65,7 +65,7 @@ impl RoutingTable {
         }
         let (tx, rx) = mpsc::channel(1024);
         let status = Arc::new(RwLock::new(PeerStatus {
-            public_key: peer_key,
+            public_key: peer_key.clone(),
             endpoint: None,
             tx_bytes: 0,
             rx_bytes: 0,
@@ -141,8 +141,7 @@ impl RoutingTable {
         endpoint: SocketAddr,
         handshake: Handshake<InitReceived>,
     ) -> bool {
-        let peer_key = handshake.peer_key();
-        if let Some(sender) = self.peer_key_sender(&peer_key) {
+        if let Some(sender) = self.peer_key_sender(handshake.peer_key()) {
             let _ = sender
                 .send(PeerAction::RecvHandshakeInit(handshake, endpoint))
                 .await;
