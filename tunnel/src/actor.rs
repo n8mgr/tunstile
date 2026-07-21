@@ -183,8 +183,7 @@ impl PeerActor {
     }
 
     async fn set_config(&mut self, config: PeerConfig) {
-        self.machine
-            .set_preshared_key(config.preshared_key.map(Into::into));
+        self.machine.set_preshared_key(config.preshared_key);
         self.persistent_keepalive = config.persistent_keepalive;
         if let Some(endpoint) = config.endpoint {
             self.machine.set_endpoint(endpoint);
@@ -567,8 +566,8 @@ pub(crate) fn spawn(
     let label = peer_label(&public_key);
     let peer_key = public_key.clone();
     let mut machine = PeerState::new(public_key);
-    if let Some(psk) = config.preshared_key {
-        machine = machine.preshared_key(psk.into());
+    if let Some(psk) = config.preshared_key.clone() {
+        machine = machine.preshared_key(psk);
     }
     tokio::spawn(
         PeerActor {

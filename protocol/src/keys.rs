@@ -153,6 +153,12 @@ impl FromStr for PresharedKey {
     }
 }
 
+impl fmt::Debug for PresharedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PresharedKey(…)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;

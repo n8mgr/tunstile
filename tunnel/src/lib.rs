@@ -42,7 +42,7 @@ use log::debug;
 use quinn_udp::{BATCH_SIZE, RecvMeta};
 use thiserror::Error;
 use tokio::{spawn, task::JoinHandle};
-pub use tunstile_protocol::{KeyParseError, PrivateKey, PublicKey};
+pub use tunstile_protocol::{KeyParseError, PresharedKey, PrivateKey, PublicKey};
 use tunstile_protocol::{
     MessageHeader,
     handshake::Handshake,
@@ -89,7 +89,7 @@ pub struct PeerConfig {
     pub endpoint: Option<SocketAddr>,
 
     /// The optional pre-shared key.
-    pub preshared_key: Option<[u8; 32]>,
+    pub preshared_key: Option<PresharedKey>,
 
     /// The persistent keepalive interval.
     pub persistent_keepalive: Option<Duration>,
@@ -651,7 +651,7 @@ mod tests {
         let pk_a = sk_a.public_key();
         let sk_b = PrivateKey::random();
         let pk_b = sk_b.public_key();
-        let psk = [7u8; 32];
+        let psk = PresharedKey::from([7u8; 32]);
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
@@ -682,7 +682,7 @@ mod tests {
             .set_peer(
                 &pk_a,
                 PeerConfig {
-                    preshared_key: Some(psk),
+                    preshared_key: Some(psk.clone()),
                     ..Default::default()
                 },
             )
@@ -745,7 +745,7 @@ mod tests {
             .add_peer(
                 &pk_a,
                 PeerConfig {
-                    preshared_key: Some([1u8; 32]),
+                    preshared_key: Some([1u8; 32].into()),
                     ..Default::default()
                 },
             )
@@ -756,7 +756,7 @@ mod tests {
                 &pk_b,
                 PeerConfig {
                     endpoint: Some(addr_b),
-                    preshared_key: Some([2u8; 32]),
+                    preshared_key: Some([2u8; 32].into()),
                     ..Default::default()
                 },
             )
