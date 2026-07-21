@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use ipnet::IpNet;
 use tun::{AbstractDevice, AsyncDevice};
-use tunstile::{Device, DeviceError, PeerConfig, PrivateKey, PublicKey};
+use tunstile::{Device, DeviceError, PeerConfig, PrivateKey, PublicKey, SendError};
 
 /// Bring up a WireGuard interface from a wg-quick style config file.
 #[derive(Parser)]
@@ -124,9 +124,13 @@ async fn run_packets(device: &Device, packets: &TunPackets) -> Result<(), Device
     loop {
         tokio::select! {
             packet = &mut recv => {
-                match device.send_packet(packet?).await {
+                match device.try_send_packet(packet?) {
                     Ok(()) => {}
-                    Err(error @ (DeviceError::InvalidPacket | DeviceError::NoPeer(_))) => {
+                    Err(error @ (
+                        DeviceError::InvalidPacket
+                        | DeviceError::NoPeer(_)
+                        | DeviceError::Send(SendError::Full)
+                    )) => {
                         log::debug!("dropping outbound packet: {error}");
                     }
                     Err(error) => return Err(error),

@@ -151,19 +151,30 @@ impl Device {
         self.tunnel.peer(public_key)
     }
 
-    /// Routes an outbound IP packet to the peer with the most-specific
-    /// matching AllowedIP.
-    pub async fn send_packet(&self, packet: impl Into<Bytes>) -> Result<(), DeviceError> {
-        let packet = packet.into();
-        let destination = packet_dst(&packet).ok_or(DeviceError::InvalidPacket)?;
-        let sender = self
-            .allowed_ips
+    fn route_packet(&self, packet: &[u8]) -> Result<PeerSender, DeviceError> {
+        let destination = packet_dst(packet).ok_or(DeviceError::InvalidPacket)?;
+        self.allowed_ips
             .read()
             .unwrap()
             .longest_match(destination)
             .cloned()
-            .ok_or(DeviceError::NoPeer(destination))?;
-        sender.send(packet).await?;
+            .ok_or(DeviceError::NoPeer(destination))
+    }
+
+    /// Routes an outbound IP packet to the peer with the most-specific
+    /// matching AllowedIP, waiting for space in that peer's send queue.
+    pub async fn send_packet(&self, packet: impl Into<Bytes>) -> Result<(), DeviceError> {
+        let packet = packet.into();
+        self.route_packet(&packet)?.send(packet).await?;
+        Ok(())
+    }
+
+    /// Routes an outbound IP packet immediately, returning
+    /// [`SendError::Full`] instead of waiting when the selected peer's send
+    /// queue has no capacity.
+    pub fn try_send_packet(&self, packet: impl Into<Bytes>) -> Result<(), DeviceError> {
+        let packet = packet.into();
+        self.route_packet(&packet)?.try_send(packet)?;
         Ok(())
     }
 

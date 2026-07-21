@@ -66,16 +66,24 @@ impl Peer {
         self.data_rx.recv().await
     }
 
-    /// Sends a payload to this peer, staging it if no session is established yet.
+    /// Sends a payload to this peer, waiting for queue capacity. Pre-session
+    /// staging is bounded and may discard older payloads.
     pub async fn send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::Closed)?;
+        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
         router.send_data(&self.public_key, payload.into()).await
+    }
+
+    /// Sends a payload immediately, returning [`SendError::Full`] instead of
+    /// waiting when this peer's queue has no capacity.
+    pub fn try_send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
+        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
+        router.try_send_data(&self.public_key, payload.into())
     }
 
     /// Updates the peer's endpoint and initiates a handshake if none is in
     /// flight. Use when the peer's address changes, e.g. after a DNS re-resolve.
     pub async fn connect(&self, endpoint: SocketAddr) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::Closed)?;
+        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
         router.connect(&self.public_key, endpoint).await
     }
 
@@ -87,7 +95,7 @@ impl Peer {
             .wait_for(|ready| *ready)
             .await
             .map(|_| ())
-            .map_err(|_| SendError::Closed)
+            .map_err(|_| SendError::TunnelClosed)
     }
 
     /// Returns a cloneable send handle. Unlike the `Peer`, it does not own the
@@ -122,15 +130,23 @@ impl PeerSender {
         &self.public_key
     }
 
-    /// Sends a payload to the peer, staging it if no session is established yet.
+    /// Sends a payload to the peer, waiting for queue capacity. Pre-session
+    /// staging is bounded and may discard older payloads.
     pub async fn send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::Closed)?;
+        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
         router.send_data(&self.public_key, payload.into()).await
+    }
+
+    /// Sends a payload immediately, returning [`SendError::Full`] instead of
+    /// waiting when this peer's queue has no capacity.
+    pub fn try_send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
+        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
+        router.try_send_data(&self.public_key, payload.into())
     }
 
     /// Updates the peer's endpoint and initiates a handshake if none is pending.
     pub async fn connect(&self, endpoint: SocketAddr) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::Closed)?;
+        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
         router.connect(&self.public_key, endpoint).await
     }
 

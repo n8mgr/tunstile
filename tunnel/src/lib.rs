@@ -64,8 +64,14 @@ const MAX_MESSAGE_SIZE: usize = 65535;
 /// Error sending to a peer.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SendError {
-    #[error("tunnel closed")]
-    Closed,
+    #[error("tunnel is closed")]
+    TunnelClosed,
+
+    #[error("peer was removed")]
+    PeerRemoved,
+
+    #[error("peer send queue is full")]
+    Full,
 }
 
 /// Error registering a peer.
@@ -211,7 +217,7 @@ impl Tunnel {
                         MessageHeader::HandshakeInit => {
                             match Handshake::receive(&our_private, segment) {
                                 Ok(handshake) => {
-                                    let _ = router.recv_handshake_init(meta.addr, handshake).await;
+                                    let _ = router.recv_handshake_init(meta.addr, handshake);
                                 }
                                 Err(e) => {
                                     debug!(
@@ -222,17 +228,14 @@ impl Tunnel {
                             }
                         }
                         MessageHeader::HandshakeResponse { receiver } => {
-                            let _ = router
-                                .recv_handshake_resp(meta.addr, receiver, segment.to_vec())
-                                .await;
+                            let _ =
+                                router.recv_handshake_resp(meta.addr, receiver, segment.to_vec());
                         }
                         MessageHeader::Data { receiver } => {
-                            let _ = router
-                                .recv_data(meta.addr, receiver, segment.to_vec())
-                                .await;
+                            let _ = router.recv_data(meta.addr, receiver, segment.to_vec());
                         }
                         MessageHeader::CookieReply { receiver } => {
-                            let _ = router.recv_cookie_reply(receiver, segment.to_vec()).await;
+                            let _ = router.recv_cookie_reply(receiver, segment.to_vec());
                         }
                     };
                 }
@@ -606,7 +609,7 @@ mod tests {
         assert!(closed.is_none());
         assert_eq!(
             peer_b.send(b"closed".to_vec()).await,
-            Err(SendError::Closed)
+            Err(SendError::TunnelClosed)
         );
     }
 
@@ -621,6 +624,7 @@ mod tests {
             .add_peer(&pk_b, PeerConfig::default())
             .await
             .unwrap();
+        let sender_b = peer_b.sender();
         assert_eq!(
             tunnel_a.add_peer(&pk_b, PeerConfig::default()).await.err(),
             Some(RegisterError::AlreadyRegistered)
@@ -629,6 +633,11 @@ mod tests {
         // dropping the handle unregisters the peer and frees the key
         drop(peer_b);
         assert!(tunnel_a.peer(&pk_b).is_none());
+        assert_eq!(sender_b.try_send(Bytes::new()), Err(SendError::PeerRemoved));
+        assert_eq!(
+            sender_b.send(Bytes::new()).await,
+            Err(SendError::PeerRemoved)
+        );
         let _peer_b = tunnel_a
             .add_peer(&pk_b, PeerConfig::default())
             .await

@@ -40,9 +40,12 @@ async fn connect(
 }
 ```
 
-Use `Peer::send` and `Peer::recv` for payloads. Dropping a `Peer` unregisters
-it. `Tunnel::set_peer` replaces the pre-shared key and persistent keepalive;
-a configured endpoint also replaces the current one. Protocol state remains
+Use `Peer::send` and `Peer::recv` for payloads. `Peer::send` waits for send
+queue capacity; `Peer::try_send` returns immediately when the queue is full.
+Successful queueing does not guarantee delivery; pre-session staging is
+bounded and may discard older payloads. Dropping a `Peer` unregisters it.
+`Tunnel::set_peer` replaces the pre-shared key and persistent keepalive; a
+configured endpoint also replaces the current one. Protocol state remains
 intact. `Tunnel::from_socket` accepts an already-bound socket when the caller
 must configure it first, such as protecting an Android VPN socket.
 

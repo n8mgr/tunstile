@@ -7,13 +7,15 @@ use std::{
 };
 
 use bytes::Bytes;
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc::{self, Sender, error::TrySendError};
 use tunstile_protocol::{
     PublicKey,
     handshake::{Handshake, InitReceived},
 };
 
 use crate::{PeerStatus, SendError, actor::PeerAction};
+
+const PEER_ACTION_QUEUE_CAPACITY: usize = 1024;
 
 struct PeerEntry {
     actions: mpsc::Sender<PeerAction>,
@@ -63,7 +65,7 @@ impl RoutingTable {
         if peers.contains_key(&peer_key) {
             return None;
         }
-        let (tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(PEER_ACTION_QUEUE_CAPACITY);
         let status = Arc::new(RwLock::new(PeerStatus {
             public_key: peer_key.clone(),
             endpoint: None,
@@ -117,11 +119,13 @@ impl RoutingTable {
         public_key: &PublicKey,
         endpoint: SocketAddr,
     ) -> Result<(), SendError> {
-        let sender = self.peer_key_sender(public_key).ok_or(SendError::Closed)?;
+        let sender = self
+            .peer_key_sender(public_key)
+            .ok_or(SendError::PeerRemoved)?;
         sender
             .send(PeerAction::Connect(endpoint))
             .await
-            .map_err(|_| SendError::Closed)
+            .map_err(|_| SendError::PeerRemoved)
     }
 
     pub(crate) async fn set_config(
@@ -129,11 +133,13 @@ impl RoutingTable {
         public_key: &PublicKey,
         config: crate::PeerConfig,
     ) -> Result<(), SendError> {
-        let sender = self.peer_key_sender(public_key).ok_or(SendError::Closed)?;
+        let sender = self
+            .peer_key_sender(public_key)
+            .ok_or(SendError::PeerRemoved)?;
         sender
             .send(PeerAction::SetConfig(config))
             .await
-            .map_err(|_| SendError::Closed)
+            .map_err(|_| SendError::PeerRemoved)
     }
 
     pub(crate) async fn send_data(
@@ -141,62 +147,95 @@ impl RoutingTable {
         public_key: &PublicKey,
         packet: Bytes,
     ) -> Result<(), SendError> {
-        let sender = self.peer_key_sender(public_key).ok_or(SendError::Closed)?;
+        let sender = self
+            .peer_key_sender(public_key)
+            .ok_or(SendError::PeerRemoved)?;
         sender
             .send(PeerAction::SendData(packet))
             .await
-            .map_err(|_| SendError::Closed)
+            .map_err(|_| SendError::PeerRemoved)
     }
 
-    pub(crate) async fn recv_handshake_init(
+    pub(crate) fn try_send_data(
+        &self,
+        public_key: &PublicKey,
+        packet: Bytes,
+    ) -> Result<(), SendError> {
+        let sender = self
+            .peer_key_sender(public_key)
+            .ok_or(SendError::PeerRemoved)?;
+        sender
+            .try_send(PeerAction::SendData(packet))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => SendError::Full,
+                TrySendError::Closed(_) => SendError::PeerRemoved,
+            })
+    }
+
+    pub(crate) fn recv_handshake_init(
         &self,
         endpoint: SocketAddr,
         handshake: Handshake<InitReceived>,
     ) -> bool {
         if let Some(sender) = self.peer_key_sender(handshake.peer_key()) {
-            let _ = sender
-                .send(PeerAction::RecvHandshakeInit(handshake, endpoint))
-                .await;
-            return true;
+            return sender
+                .try_send(PeerAction::RecvHandshakeInit(handshake, endpoint))
+                .is_ok();
         }
         false
     }
 
-    pub(crate) async fn recv_handshake_resp(
+    pub(crate) fn recv_handshake_resp(
         &self,
         endpoint: SocketAddr,
         peer_index: u32,
         packet: Vec<u8>,
     ) -> bool {
         if let Some(sender) = self.peer_index_sender(peer_index) {
-            let _ = sender
-                .send(PeerAction::RecvHandshakeResp(packet, endpoint))
-                .await;
-            return true;
+            return sender
+                .try_send(PeerAction::RecvHandshakeResp(packet, endpoint))
+                .is_ok();
         }
         false
     }
 
-    pub(crate) async fn recv_data(
-        &self,
-        endpoint: SocketAddr,
-        peer_index: u32,
-        packet: Vec<u8>,
-    ) -> bool {
+    pub(crate) fn recv_data(&self, endpoint: SocketAddr, peer_index: u32, packet: Vec<u8>) -> bool {
         if let Some(sender) = self.peer_index_sender(peer_index) {
-            let _ = sender
-                .send(PeerAction::RecvData(packet, peer_index, endpoint))
-                .await;
-            return true;
+            return sender
+                .try_send(PeerAction::RecvData(packet, peer_index, endpoint))
+                .is_ok();
         }
         false
     }
 
-    pub(crate) async fn recv_cookie_reply(&self, peer_index: u32, packet: Vec<u8>) -> bool {
+    pub(crate) fn recv_cookie_reply(&self, peer_index: u32, packet: Vec<u8>) -> bool {
         if let Some(sender) = self.peer_index_sender(peer_index) {
-            let _ = sender.send(PeerAction::RecvCookieReply(packet)).await;
-            return true;
+            return sender.try_send(PeerAction::RecvCookieReply(packet)).is_ok();
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tunstile_protocol::PrivateKey;
+
+    #[test]
+    fn full_peer_queue_does_not_accept_network_input() {
+        let router = RoutingTable::new();
+        let public_key = PrivateKey::random().public_key();
+        let (_actions, _) = router.register_peer(public_key.clone()).unwrap();
+        assert!(router.bind_index(&public_key, 7));
+
+        for _ in 0..PEER_ACTION_QUEUE_CAPACITY {
+            assert_eq!(router.try_send_data(&public_key, Bytes::new()), Ok(()));
+        }
+
+        assert_eq!(
+            router.try_send_data(&public_key, Bytes::new()),
+            Err(SendError::Full)
+        );
+        assert!(!router.recv_data("127.0.0.1:1".parse().unwrap(), 7, Vec::new()));
     }
 }
