@@ -1,5 +1,25 @@
-//! An async WireGuard tunnel: peers, sessions, and timers over one UDP
-//! socket, driving the sans-IO state machines in `tunstile_protocol`.
+//! An async WireGuard tunnel that drives [tunstile_protocol] over one UDP
+//! socket. It owns peer sessions and timers but does not apply IP routing or
+//! AllowedIPs policy.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use std::{error::Error, net::SocketAddr};
+//! use tunstile_tunnel::{Peer, PeerConfig, PrivateKey, PublicKey, Tunnel};
+//!
+//! async fn connect(
+//!     private_key: PrivateKey,
+//!     peer_key: PublicKey,
+//!     endpoint: SocketAddr,
+//! ) -> Result<(Tunnel, Peer), Box<dyn Error>> {
+//!     let tunnel = Tunnel::new("0.0.0.0:0".parse()?, private_key).await?;
+//!     let peer = tunnel
+//!         .add_peer(PeerConfig::new(peer_key).endpoint(endpoint))
+//!         .await?;
+//!     Ok((tunnel, peer))
+//! }
+//! ```
 
 use std::{
     io::{self, IoSliceMut},
@@ -105,6 +125,26 @@ pub struct PeerStatus {
 
 /// A WireGuard tunnel: one UDP socket multiplexing any number of registered
 /// peers.
+///
+/// # Example
+///
+/// ```no_run
+/// use tunstile_tunnel::{PrivateKey, Tunnel};
+///
+/// # async fn connect() -> Result<(), Box<dyn std::error::Error>> {
+/// let tunnel = Tunnel::new("0.0.0.0:0".parse()?, PrivateKey::random()).await?;
+/// let mut peer = tunnel
+///     .connect_peer(
+///         "jrpP5X9mNSxjkd6tCnHwdRI4Rp8ZnquQj34UAqlZpx8=".parse()?,
+///         "203.0.113.1:51820".parse()?,
+///     )
+///     .await?;
+///
+/// peer.send(vec![0u8; 20]).await?;
+/// let _next_packet = peer.recv().await;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Tunnel {
     our_key: PrivateKey,
     socket: Arc<UdpSocket>,
@@ -282,6 +322,20 @@ impl Tunnel {
     /// Takes ownership of the socket. This lets callers apply platform-specific
     /// configuration, such as protecting an Android VPN socket, before any
     /// tunnel traffic is sent.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::net::UdpSocket;
+    /// use tunstile_tunnel::{PrivateKey, Tunnel};
+    ///
+    /// # async fn start() -> Result<(), Box<dyn std::error::Error>> {
+    /// let socket = UdpSocket::bind("0.0.0.0:0")?;
+    /// // Apply platform-specific socket configuration here.
+    /// let _tunnel = Tunnel::from_socket(socket, PrivateKey::random()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn from_socket(socket: std::net::UdpSocket, our_key: PrivateKey) -> io::Result<Self> {
         let socket = UdpSocket::from_std(socket)?;
         Ok(Self::start(socket, our_key))

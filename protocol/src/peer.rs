@@ -138,6 +138,45 @@ struct PendingHandshake {
 }
 
 /// The per-peer protocol state.
+///
+/// # Example
+///
+/// The driver supplies the receiver index, ephemeral secret, timestamp, and
+/// output buffer for each handshake attempt:
+///
+/// ```
+/// use tunstile_protocol::{PrivateKey, ReusableSecret, Tai64N};
+/// use tunstile_protocol::{
+///     handshake::INIT_MSG_LENGTH,
+///     peer::{HandshakeValues, Peer, PeerError},
+/// };
+///
+/// fn write_initiation(
+///     peer: &mut Peer,
+///     ephemeral_secret: ReusableSecret,
+/// ) -> Result<[u8; INIT_MSG_LENGTH], PeerError> {
+///     let mut packet = [0u8; INIT_MSG_LENGTH];
+///     peer.initiate(
+///         HandshakeValues {
+///             index: 1,
+///             ephemeral_secret,
+///             timestamp: Tai64N::UNIX_EPOCH,
+///         },
+///         &mut packet,
+///     )?;
+///     Ok(packet)
+/// }
+///
+/// let mut peer = Peer::new(
+///     PrivateKey::from([1u8; 32]),
+///     PrivateKey::from([2u8; 32]).public_key(),
+/// );
+/// peer.set_endpoint("203.0.113.1:51820".parse().unwrap());
+///
+/// // Supply a CSPRNG-generated `ReusableSecret`, send the returned packet to
+/// // `peer.endpoint()`, and schedule a retry if needed.
+/// # let _ = (&mut peer, write_initiation);
+/// ```
 pub struct Peer {
     our_key: PrivateKey,
     peer_key: PublicKey,

@@ -1,6 +1,16 @@
-//! A sans-IO implementation of the WireGuard protocol: handshake, transport,
-//! cookie, and per-peer state machinery with no sockets, clocks, or
-//! allocation.
+//! Sans-I/O WireGuard handshake, transport, cookie, and per-peer state
+//! machinery. The caller supplies packet buffers, time, randomness, and
+//! scheduling.
+//!
+//! # Example
+//!
+//! ```
+//! use tunstile_protocol::{PrivateKey, PublicKey, peer::Peer};
+//!
+//! fn new_peer(private_key: PrivateKey, public_key: PublicKey) -> Peer {
+//!     Peer::new(private_key, public_key)
+//! }
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 

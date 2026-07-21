@@ -1,3 +1,5 @@
+//! A user-space implementation of Wireguard using tunstile
+
 use std::{
     fs,
     net::{SocketAddr, ToSocketAddrs},
@@ -8,7 +10,7 @@ use std::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use clap::Parser;
 use ipnet::IpNet;
-use tunstile_device::{Device, DeviceConfig, PeerConfig, PublicKey};
+use tunstile::{Device, DeviceConfig, PeerConfig, PublicKey};
 
 /// Bring up a WireGuard interface from a wg-quick style config file.
 #[derive(Parser)]

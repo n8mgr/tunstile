@@ -1,9 +1,10 @@
-# SpaceTun
+# Tunstile
 
 An experimental Rust implementation of the Wireguard spec. For fun and learning. Not for production use.
 
 ## Structure
 
+- `tunstile` - the complete device library and command-line program: TUN integration, AllowedIPs, and OS routing.
 - `protocol` - a Wireguard-compatible protocol implementation. `no_std` compatible.
 - `tunnel` - a self-maintaining Wireguard tunnel: UDP sockets, sessions, timers, and packet processing.
 

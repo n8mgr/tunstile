@@ -1399,7 +1399,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tunstile_device"
+name = "tunstile"
 version = "0.0.1"
 dependencies = [
  "base64",
