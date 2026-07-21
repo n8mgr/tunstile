@@ -63,12 +63,6 @@ pub enum DeviceError {
     #[error("peer already registered")]
     AlreadyRegistered,
 
-    #[error("invalid IP packet")]
-    InvalidPacket,
-
-    #[error("no peer allows destination {0}")]
-    NoPeer(IpAddr),
-
     #[error("peer {0} is not registered")]
     UnknownPeer(PublicKey),
 
@@ -151,31 +145,52 @@ impl Device {
         self.tunnel.peer(public_key)
     }
 
-    fn route_packet(&self, packet: &[u8]) -> Result<PeerSender, DeviceError> {
-        let destination = packet_dst(packet).ok_or(DeviceError::InvalidPacket)?;
-        self.allowed_ips
+    fn route_packet(&self, packet: &[u8]) -> Option<PeerSender> {
+        let Some(destination) = packet_dst(packet) else {
+            debug!("dropping invalid outbound packet");
+            return None;
+        };
+        let sender = self
+            .allowed_ips
             .read()
             .unwrap()
             .longest_match(destination)
-            .cloned()
-            .ok_or(DeviceError::NoPeer(destination))
+            .cloned();
+        if sender.is_none() {
+            debug!("dropping outbound packet: no peer allows destination {destination}");
+        }
+        sender
     }
 
     /// Routes an outbound IP packet to the peer with the most-specific
-    /// matching AllowedIP, waiting for space in that peer's send queue.
-    pub async fn send_packet(&self, packet: impl Into<Bytes>) -> Result<(), DeviceError> {
+    /// matching AllowedIP, waiting for space in that peer's send queue. Invalid
+    /// and unroutable packets are dropped and return `Ok(())`.
+    pub async fn send_packet(&self, packet: impl Into<Bytes>) -> Result<(), SendError> {
         let packet = packet.into();
-        self.route_packet(&packet)?.send(packet).await?;
-        Ok(())
+        let Some(sender) = self.route_packet(&packet) else {
+            return Ok(());
+        };
+        sender.send(packet).await
     }
 
-    /// Routes an outbound IP packet immediately, returning
-    /// [`SendError::Full`] instead of waiting when the selected peer's send
-    /// queue has no capacity.
-    pub fn try_send_packet(&self, packet: impl Into<Bytes>) -> Result<(), DeviceError> {
+    /// Routes an outbound IP packet immediately. A full send queue, invalid
+    /// packet, or missing route causes the packet to be dropped and return `Ok(())`.
+    pub fn try_send_packet(&self, packet: impl Into<Bytes>) -> Result<(), SendError> {
         let packet = packet.into();
-        self.route_packet(&packet)?.try_send(packet)?;
-        Ok(())
+        let Some(sender) = self.route_packet(&packet) else {
+            return Ok(());
+        };
+        match sender.try_send(packet) {
+            Err(SendError::Full) => {
+                debug!(
+                    "dropping outbound packet for {}: send queue full",
+                    sender.public_key()
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+            Ok(()) => Ok(()),
+        }
     }
 
     /// Receives the next authenticated inbound IP packet.
@@ -189,15 +204,16 @@ impl Device {
     pub async fn add_peer(
         &self,
         public_key: &PublicKey,
-        config: PeerConfig,
+        mut config: PeerConfig,
     ) -> Result<(), DeviceError> {
         let _update = self.peer_updates.lock().await;
         if self.peers.read().unwrap().contains_key(public_key) {
             return Err(DeviceError::AlreadyRegistered);
         }
+        let tunnel_config = config.take_tunnel();
         let peer = self
             .tunnel
-            .add_peer(public_key, config.to_tunnel())
+            .add_peer(public_key, tunnel_config)
             .await
             .map_err(|error| match error {
                 RegisterError::AlreadyRegistered => DeviceError::AlreadyRegistered,
@@ -205,8 +221,8 @@ impl Device {
         let sender = peer.sender();
         {
             let mut allowed_ips = self.allowed_ips.write().unwrap();
-            for net in &config.allowed_ips {
-                allowed_ips.insert(*net, sender.clone());
+            for net in config.allowed_ips {
+                allowed_ips.insert(net, sender.clone());
             }
         }
         let task = spawn(inbound_loop(
@@ -231,14 +247,15 @@ impl Device {
     pub async fn set_peer(
         &self,
         public_key: &PublicKey,
-        config: PeerConfig,
+        mut config: PeerConfig,
     ) -> Result<(), DeviceError> {
         let _update = self.peer_updates.lock().await;
         if !self.peers.read().unwrap().contains_key(public_key) {
             return Err(DeviceError::UnknownPeer(public_key.clone()));
         }
 
-        self.tunnel.set_peer(public_key, config.to_tunnel()).await?;
+        let tunnel_config = config.take_tunnel();
+        self.tunnel.set_peer(public_key, tunnel_config).await?;
 
         let peers = self.peers.read().unwrap();
         let entry = peers
@@ -420,17 +437,16 @@ mod tests {
 
         let a_to_b = Bytes::from(ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]));
         let b_to_a = Bytes::from(ipv4_packet([10, 0, 0, 2], [10, 0, 0, 1]));
-        assert!(matches!(
+        assert_eq!(
             device_a.send_packet(Bytes::from_static(b"invalid")).await,
-            Err(DeviceError::InvalidPacket)
-        ));
-        assert!(matches!(
+            Ok(())
+        );
+        assert_eq!(
             device_a
                 .send_packet(ipv4_packet([10, 0, 0, 1], [10, 0, 0, 3]))
                 .await,
-            Err(DeviceError::NoPeer(address))
-                if address == "10.0.0.3".parse::<IpAddr>().unwrap()
-        ));
+            Ok(())
+        );
 
         device_a.send_packet(a_to_b.clone()).await.unwrap();
         let received =
@@ -458,11 +474,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            device_a.send_packet(a_to_b).await,
-            Err(DeviceError::NoPeer(address))
-                if address == "10.0.0.2".parse::<IpAddr>().unwrap()
-        ));
+        assert_eq!(device_a.send_packet(a_to_b).await, Ok(()));
 
         let rerouted = Bytes::from(ipv4_packet([10, 0, 0, 1], [10, 0, 0, 3]));
         device_a.send_packet(rerouted.clone()).await.unwrap();

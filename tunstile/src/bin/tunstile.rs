@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use ipnet::IpNet;
 use tun::{AbstractDevice, AsyncDevice};
-use tunstile::{Device, DeviceError, PeerConfig, PrivateKey, PublicKey, SendError};
+use tunstile::{Device, DeviceError, PeerConfig, PrivateKey, PublicKey};
 
 /// Bring up a WireGuard interface from a wg-quick style config file.
 #[derive(Parser)]
@@ -35,10 +35,12 @@ async fn main() {
     let device = Device::new(listen_addr, private_key)
         .await
         .unwrap_or_else(|e| fail(format!("creating device: {e}")));
-    let packets = TunPackets::new(&tun_config)
-        .unwrap_or_else(|e| fail(format!("bringing up interface: {e}")));
-    let tun_name = packets
+    let tun =
+        create_tun(&tun_config).unwrap_or_else(|e| fail(format!("bringing up interface: {e}")));
+    let tun_name = tun
         .tun_name()
+        .ok()
+        .filter(|name| !name.is_empty())
         .unwrap_or_else(|| fail("interface has no name".into()));
 
     let peer_count = peer_configs.len();
@@ -54,7 +56,7 @@ async fn main() {
     println!("{tun_name} up with {peer_count} peer(s); ctrl-c to stop");
 
     tokio::select! {
-        result = run_packets(&device, &packets) => match result {
+        result = run_packets(&device, &tun, tun_config.mtu as usize) => match result {
             Ok(()) => println!("packet interface closed"),
             Err(error) => fail(format!("packet interface: {error}")),
         },
@@ -81,67 +83,38 @@ struct TunConfig {
     mtu: u16,
 }
 
-struct TunPackets {
-    tun: AsyncDevice,
-    mtu: usize,
+fn create_tun(config: &TunConfig) -> io::Result<AsyncDevice> {
+    let mut tun_config = tun::Configuration::default();
+    tun_config
+        .address(config.address.addr())
+        .netmask(config.address.netmask())
+        .mtu(config.mtu)
+        .up();
+    tun::create_as_async(&tun_config).map_err(io::Error::from)
 }
 
-impl TunPackets {
-    fn new(config: &TunConfig) -> io::Result<Self> {
-        let mut tun_config = tun::Configuration::default();
-        tun_config
-            .address(config.address.addr())
-            .netmask(config.address.netmask())
-            .mtu(config.mtu)
-            .up();
-        let tun = tun::create_as_async(&tun_config).map_err(io::Error::from)?;
-        Ok(Self {
-            tun,
-            mtu: config.mtu as usize,
-        })
-    }
-
-    fn tun_name(&self) -> Option<String> {
-        self.tun.tun_name().ok().filter(|name| !name.is_empty())
-    }
-
-    async fn recv(&self) -> io::Result<Bytes> {
-        let mut packet = BytesMut::with_capacity(self.mtu);
-        packet.resize(self.mtu, 0);
-        let len = self.tun.recv(&mut packet).await?;
-        packet.truncate(len);
-        Ok(packet.freeze())
-    }
-
-    async fn send(&self, packet: Bytes) -> io::Result<()> {
-        self.tun.send(&packet).await.map(|_| ())
-    }
+async fn recv_tun(tun: &AsyncDevice, mtu: usize) -> io::Result<Bytes> {
+    let mut packet = BytesMut::with_capacity(mtu);
+    packet.resize(mtu, 0);
+    let len = tun.recv(&mut packet).await?;
+    packet.truncate(len);
+    Ok(packet.freeze())
 }
 
-async fn run_packets(device: &Device, packets: &TunPackets) -> Result<(), DeviceError> {
-    let recv = packets.recv();
+async fn run_packets(device: &Device, tun: &AsyncDevice, mtu: usize) -> Result<(), DeviceError> {
+    let recv = recv_tun(tun, mtu);
     tokio::pin!(recv);
     loop {
         tokio::select! {
             packet = &mut recv => {
-                match device.try_send_packet(packet?) {
-                    Ok(()) => {}
-                    Err(error @ (
-                        DeviceError::InvalidPacket
-                        | DeviceError::NoPeer(_)
-                        | DeviceError::Send(SendError::Full)
-                    )) => {
-                        log::debug!("dropping outbound packet: {error}");
-                    }
-                    Err(error) => return Err(error),
-                }
-                recv.set(packets.recv());
+                device.try_send_packet(packet?)?;
+                recv.set(recv_tun(tun, mtu));
             }
             packet = device.recv_packet() => {
                 let Some(packet) = packet else {
                     return Ok(());
                 };
-                packets.send(packet).await?;
+                tun.send(&packet).await?;
             }
         }
     }
@@ -249,7 +222,7 @@ fn parse_config(text: &str) -> Result<ParsedConfig, String> {
             public_key,
             PeerConfig {
                 endpoint: peer.endpoint,
-                preshared_key: peer.preshared_key,
+                preshared_key: peer.preshared_key.map(Into::into),
                 persistent_keepalive: peer.keepalive.map(Duration::from_secs),
                 allowed_ips: peer.allowed_ips,
             },

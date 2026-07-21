@@ -56,9 +56,11 @@ async fn start(
 Peers remain registered until removed with `Device::remove_peer`. Feed outbound
 interface packets into `Device::send_packet` and inject packets returned by
 `Device::recv_packet`. `Device::send_packet` applies backpressure;
-`Device::try_send_packet` reports a full peer queue immediately. Only one
-`recv_packet` call may be active at a time. Interface addresses and
-operating-system routes remain the platform integration's responsibility.
+`Device::try_send_packet` instead drops when the selected peer's queue is full.
+Both methods also drop invalid and unroutable packets, returning errors only for
+operational failures. Only one `recv_packet` call may be active at a time.
+Interface addresses and operating-system routes remain the platform
+integration's responsibility.
 
 `Device::set_peer` replaces a registered peer's configuration in place.
 AllowedIPs change atomically, and the peer's protocol state remains intact.

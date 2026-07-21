@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use ipnet::IpNet;
+use tunstile_tunnel::PresharedKey;
 
 /// Optional settings and allowed IP prefixes for a peer.
 #[derive(Clone, Debug, Default)]
@@ -10,7 +11,7 @@ pub struct PeerConfig {
     pub endpoint: Option<SocketAddr>,
 
     /// The optional pre-shared key.
-    pub preshared_key: Option<[u8; 32]>,
+    pub preshared_key: Option<PresharedKey>,
 
     /// The persistent keepalive interval.
     pub persistent_keepalive: Option<Duration>,
@@ -20,10 +21,10 @@ pub struct PeerConfig {
 }
 
 impl PeerConfig {
-    pub(crate) fn to_tunnel(&self) -> tunstile_tunnel::PeerConfig {
+    pub(crate) fn take_tunnel(&mut self) -> tunstile_tunnel::PeerConfig {
         tunstile_tunnel::PeerConfig {
             endpoint: self.endpoint,
-            preshared_key: self.preshared_key,
+            preshared_key: self.preshared_key.take(),
             persistent_keepalive: self.persistent_keepalive,
         }
     }
