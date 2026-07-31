@@ -1,12 +1,12 @@
 # Tunstile
 
-An experimental Rust implementation of the Wireguard spec. For fun and learning. Not for production use.
+An experimental Rust implementation of the Wireguard spec focusing on programmability
 
 ## Structure
 
 - `tunstile` - packet routing, AllowedIPs enforcement, a platform packet boundary, and the command-line program.
-- `protocol` - a Wireguard-compatible protocol implementation. `no_std` compatible.
 - `tunnel` - a self-maintaining Wireguard tunnel: UDP sockets, sessions, timers, and packet processing.
+- `protocol` - a Wireguard-compatible protocol implementation. `no_std` compatible.
 
 ## Benchmarks
 

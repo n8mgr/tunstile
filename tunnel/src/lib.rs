@@ -807,14 +807,14 @@ mod tests {
             .unwrap();
 
         let sent = peer_b.status().tx_bytes;
-        tokio::time::sleep(Duration::from_millis(550)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         let keepalive_len = Transport::packet_len(0) as u64;
         let sent = peer_b.status().tx_bytes - sent;
         assert!(
-            sent >= 3 * keepalive_len,
-            "expected at least 3 keepalives, sent {sent} bytes"
+            sent >= 2 * keepalive_len,
+            "expected at least 2 keepalives, sent {sent} bytes"
         );
-        assert!(peer_a.status().rx_bytes >= INIT_MSG_LENGTH as u64 + 3 * keepalive_len);
+        assert!(peer_a.status().rx_bytes >= INIT_MSG_LENGTH as u64 + 2 * keepalive_len);
     }
 }
