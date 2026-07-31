@@ -75,8 +75,8 @@ fn bench_transport(c: &mut Criterion) {
                 (payload, buf)
             },
             |(payload, mut encrypted_packet)| {
-                let received_payload = t_resp.receive(&mut encrypted_packet).unwrap();
-                assert_eq!(received_payload.1, payload);
+                let (_, received_payload) = t_resp.receive(&mut encrypted_packet).unwrap();
+                assert_eq!(&encrypted_packet[received_payload], payload);
             },
             BatchSize::SmallInput,
         );

@@ -8,7 +8,6 @@ use std::{
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
-use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use ipnet::IpNet;
 use tun::{AbstractDevice, AsyncDevice};
@@ -93,12 +92,11 @@ fn create_tun(config: &TunConfig) -> io::Result<AsyncDevice> {
     tun::create_as_async(&tun_config).map_err(io::Error::from)
 }
 
-async fn recv_tun(tun: &AsyncDevice, mtu: usize) -> io::Result<Bytes> {
-    let mut packet = BytesMut::with_capacity(mtu);
-    packet.resize(mtu, 0);
+async fn recv_tun(tun: &AsyncDevice, mtu: usize) -> io::Result<Vec<u8>> {
+    let mut packet = vec![0; mtu];
     let len = tun.recv(&mut packet).await?;
     packet.truncate(len);
-    Ok(packet.freeze())
+    Ok(packet)
 }
 
 async fn run_packets(device: &Device, tun: &AsyncDevice, mtu: usize) -> Result<(), DeviceError> {

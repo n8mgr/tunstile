@@ -1,8 +1,8 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::{runtime::Runtime, sync::Mutex};
-use tunstile_tunnel::{Bytes, Peer, PeerConfig, PrivateKey, Tunnel};
+use tunstile_tunnel::{Peer, PeerConfig, PrivateKey, Tunnel};
 
 const PAYLOAD_LEN: usize = 1420;
 const BATCH: usize = 256;
@@ -55,20 +55,23 @@ fn setup(rt: &Runtime) -> Established {
 fn bench_roundtrip(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let (_tunnel_a, _tunnel_b, peer_b, peer_a) = setup(&rt);
-    let payload = Bytes::from(vec![0xABu8; PAYLOAD_LEN]);
+    let payload = vec![0xABu8; PAYLOAD_LEN];
 
     let mut group = c.benchmark_group("tunnel");
     group.throughput(Throughput::Bits(PAYLOAD_LEN as u64 * 8));
     group.bench_function("datapath_roundtrip", |b| {
-        b.to_async(&rt).iter(|| {
-            let peer_b = peer_b.clone();
-            let peer_a = peer_a.clone();
-            let payload = payload.clone();
-            async move {
-                peer_b.send(payload).await.unwrap();
-                peer_a.lock().await.recv().await.unwrap();
-            }
-        });
+        b.to_async(&rt).iter_batched(
+            || payload.clone(),
+            |payload| {
+                let peer_b = peer_b.clone();
+                let peer_a = peer_a.clone();
+                async move {
+                    peer_b.send(payload).await.unwrap();
+                    peer_a.lock().await.recv().await.unwrap();
+                }
+            },
+            BatchSize::SmallInput,
+        );
     });
     group.finish();
 }
@@ -78,30 +81,33 @@ fn bench_roundtrip(c: &mut Criterion) {
 fn bench_pipelined(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let (_tunnel_a, _tunnel_b, peer_b, peer_a) = setup(&rt);
-    let payload = Bytes::from(vec![0xABu8; PAYLOAD_LEN]);
+    let payload = vec![0xABu8; PAYLOAD_LEN];
 
     let mut group = c.benchmark_group("tunnel");
     group.throughput(Throughput::Bits((BATCH * PAYLOAD_LEN) as u64 * 8));
     group.bench_function("datapath_pipelined", |b| {
-        b.to_async(&rt).iter(|| {
-            let peer_b = peer_b.clone();
-            let peer_a = peer_a.clone();
-            let payload = payload.clone();
-            async move {
-                let send_all = async {
-                    for _ in 0..BATCH {
-                        peer_b.send(payload.clone()).await.unwrap();
-                    }
-                };
-                let recv_all = async {
-                    let mut rx = peer_a.lock().await;
-                    for _ in 0..BATCH {
-                        rx.recv().await.unwrap();
-                    }
-                };
-                tokio::join!(send_all, recv_all);
-            }
-        });
+        b.to_async(&rt).iter_batched(
+            || vec![payload.clone(); BATCH],
+            |payloads| {
+                let peer_b = peer_b.clone();
+                let peer_a = peer_a.clone();
+                async move {
+                    let send_all = async {
+                        for payload in payloads {
+                            peer_b.send(payload).await.unwrap();
+                        }
+                    };
+                    let recv_all = async {
+                        let mut rx = peer_a.lock().await;
+                        for _ in 0..BATCH {
+                            rx.recv().await.unwrap();
+                        }
+                    };
+                    tokio::join!(send_all, recv_all);
+                }
+            },
+            BatchSize::LargeInput,
+        );
     });
     group.finish();
 }

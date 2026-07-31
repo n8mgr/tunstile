@@ -1,6 +1,6 @@
 use core::{
     array,
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, RangeFrom},
 };
 
 use blake2::{Blake2s256, Blake2sMac, Digest};
@@ -100,13 +100,26 @@ pub(crate) fn aead_open<'a>(
     auth_text: &[u8],
     cipher_text: &'a mut [u8],
 ) -> Result<&'a mut [u8], OpenError> {
+    aead_open_within(key, counter, auth_text, cipher_text, 0..)
+}
+
+/// Decrypts ciphertext at `ciphertext` while writing the plaintext at the
+/// beginning of `data`.
+pub(crate) fn aead_open_within<'a>(
+    key: &LessSafeKey,
+    counter: u64,
+    auth_text: &[u8],
+    data: &'a mut [u8],
+    ciphertext: RangeFrom<usize>,
+) -> Result<&'a mut [u8], OpenError> {
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
 
-    key.open_in_place(
+    key.open_within(
         Nonce::assume_unique_for_key(nonce),
         Aad::from(auth_text),
-        cipher_text,
+        data,
+        ciphertext,
     )
     .map_err(|_| OpenError::Failed)
 }

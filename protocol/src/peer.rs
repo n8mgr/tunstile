@@ -13,8 +13,11 @@
 //! for drivers; sloppy (second-granularity) scheduling is fine — the spec
 //! itself jitters retransmit timing.
 
-use core::net::{IpAddr, SocketAddr};
-use core::time::Duration;
+use core::{
+    net::{IpAddr, SocketAddr},
+    ops::Range,
+    time::Duration,
+};
 
 use tai64::Tai64N;
 use thiserror::Error;
@@ -100,9 +103,10 @@ pub struct HandshakeValues {
 }
 
 /// A decrypted transport message from [`Peer::decrypt`].
-pub struct Recv<'p> {
-    /// The plaintext; empty for a keepalive.
-    pub payload: &'p [u8],
+pub struct Recv {
+    /// The plaintext range within the packet passed to [`Peer::decrypt`]. It
+    /// is empty for a keepalive.
+    pub payload: Range<usize>,
 
     /// True when this packet confirmed a responder session, making it the
     /// send session: staged payloads can be flushed.
@@ -397,13 +401,13 @@ impl Peer {
     /// Decrypts a transport data message addressed to `receiver`. The peer's
     /// first authenticated packet on a responder session confirms it (see
     /// [`Recv::confirmed`]).
-    pub fn decrypt<'p>(
+    pub fn decrypt(
         &mut self,
         now: Instant,
         receiver: u32,
-        packet: &'p mut [u8],
+        packet: &mut [u8],
         source: SocketAddr,
-    ) -> Result<Recv<'p>, PeerError> {
+    ) -> Result<Recv, PeerError> {
         let matches = |s: &Option<Session>| {
             s.as_ref()
                 .is_some_and(|s| s.transport.our_index() == receiver)
@@ -626,7 +630,7 @@ mod tests {
         let recv = b
             .decrypt(now, receiver, &mut buf[..len], addr(9))
             .expect("valid data");
-        assert_eq!(recv.payload, payload);
+        assert_eq!(&buf[recv.payload.clone()], payload);
         assert!(!recv.confirmed);
         // roaming: the authenticated packet's source becomes the endpoint
         assert_eq!(b.endpoint(), Some(addr(9)));
@@ -638,7 +642,7 @@ mod tests {
         let recv = a
             .decrypt(now, receiver, &mut buf[..len], addr(2))
             .expect("valid data");
-        assert_eq!(recv.payload, payload);
+        assert_eq!(&buf[recv.payload], payload);
     }
 
     #[test]

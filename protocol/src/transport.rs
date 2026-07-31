@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     AEAD_TAG_SIZE, MessageType,
-    crypto::{aead_open, aead_seal},
+    crypto::{aead_open_within, aead_seal},
 };
 
 // data msg wire layout: [type(1) | reserved(3) | receiver(4) | counter(8) | payload+tag(...)]
@@ -154,10 +154,11 @@ impl Transport {
         DATA_PAYLOAD_OFFSET + payload_size + AEAD_TAG_SIZE
     }
 
-    /// Decrypts a received encrypted transport data message, returning its
-    /// counter and payload. The counter must be checked against a
-    /// [`ReplayFilter`] before the payload is trusted.
-    pub fn receive<'a>(&self, packet: &'a mut [u8]) -> Result<(u64, &'a [u8]), TransportError> {
+    /// Decrypts a received encrypted transport data message in place,
+    /// returning its counter and the plaintext range at the beginning of
+    /// `packet`. The counter must be checked against a [`ReplayFilter`] before
+    /// the payload is trusted.
+    pub fn receive(&self, packet: &mut [u8]) -> Result<(u64, Range<usize>), TransportError> {
         if packet.len() < Self::packet_len(0)
             || MessageType::try_from(packet[0]) != Ok(MessageType::Data)
             || packet[1..4] != [0; 3]
@@ -177,14 +178,11 @@ impl Transport {
                 .try_into()
                 .map_err(|_| TransportError::InvalidPacket)?,
         );
-        let plaintext = aead_open(
-            &self.recv_aead,
-            counter,
-            &[],
-            &mut packet[DATA_PAYLOAD_OFFSET..],
-        )
-        .map_err(|_| TransportError::InvalidPacket)?;
-        Ok((counter, &*plaintext))
+        let plaintext_len =
+            aead_open_within(&self.recv_aead, counter, &[], packet, DATA_PAYLOAD_OFFSET..)
+                .map_err(|_| TransportError::InvalidPacket)?
+                .len();
+        Ok((counter, 0..plaintext_len))
     }
 }
 

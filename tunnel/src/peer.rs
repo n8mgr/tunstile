@@ -7,7 +7,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 use tunstile_protocol::PublicKey;
 
@@ -22,7 +21,7 @@ pub struct Peer {
     router: Weak<RoutingTable>,
     status: Arc<RwLock<PeerStatus>>,
     session_rx: watch::Receiver<bool>,
-    data_rx: mpsc::Receiver<Bytes>,
+    data_rx: mpsc::Receiver<Vec<u8>>,
 }
 
 impl Drop for Peer {
@@ -39,7 +38,7 @@ impl Peer {
         router: Weak<RoutingTable>,
         status: Arc<RwLock<PeerStatus>>,
         session_rx: watch::Receiver<bool>,
-        data_rx: mpsc::Receiver<Bytes>,
+        data_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Self {
         Self {
             public_key,
@@ -62,22 +61,22 @@ impl Peer {
 
     /// Receives the next decrypted payload from this peer. Returns `None`
     /// once the peer is removed or the tunnel is dropped.
-    pub async fn recv(&mut self) -> Option<Bytes> {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
         self.data_rx.recv().await
     }
 
     /// Sends a payload to this peer, waiting for queue capacity. Pre-session
     /// staging is bounded and may discard older payloads.
-    pub async fn send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
+    pub async fn send(&self, payload: Vec<u8>) -> Result<(), SendError> {
         let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.send_data(&self.public_key, payload.into()).await
+        router.send_data(&self.public_key, payload).await
     }
 
     /// Sends a payload immediately, returning [`SendError::Full`] instead of
     /// waiting when this peer's queue has no capacity.
-    pub fn try_send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
+    pub fn try_send(&self, payload: Vec<u8>) -> Result<(), SendError> {
         let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.try_send_data(&self.public_key, payload.into())
+        router.try_send_data(&self.public_key, payload)
     }
 
     /// Updates the peer's endpoint and initiates a handshake if none is in
@@ -109,7 +108,7 @@ impl Peer {
 }
 
 impl futures_core::Stream for Peer {
-    type Item = Bytes;
+    type Item = Vec<u8>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.get_mut().data_rx.poll_recv(cx)
@@ -132,16 +131,16 @@ impl PeerSender {
 
     /// Sends a payload to the peer, waiting for queue capacity. Pre-session
     /// staging is bounded and may discard older payloads.
-    pub async fn send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
+    pub async fn send(&self, payload: Vec<u8>) -> Result<(), SendError> {
         let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.send_data(&self.public_key, payload.into()).await
+        router.send_data(&self.public_key, payload).await
     }
 
     /// Sends a payload immediately, returning [`SendError::Full`] instead of
     /// waiting when this peer's queue has no capacity.
-    pub fn try_send(&self, payload: impl Into<Bytes>) -> Result<(), SendError> {
+    pub fn try_send(&self, payload: Vec<u8>) -> Result<(), SendError> {
         let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.try_send_data(&self.public_key, payload.into())
+        router.try_send_data(&self.public_key, payload)
     }
 
     /// Updates the peer's endpoint and initiates a handshake if none is pending.

@@ -1403,7 +1403,6 @@ name = "tunstile"
 version = "0.0.1"
 dependencies = [
  "base64",
- "bytes",
  "clap",
  "env_logger",
  "ipnet",
@@ -1437,7 +1436,6 @@ name = "tunstile_tunnel"
 version = "0.0.1"
 dependencies = [
  "base64",
- "bytes",
  "clap",
  "criterion",
  "env_logger",

@@ -37,7 +37,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-pub use bytes::Bytes;
 use log::debug;
 use quinn_udp::{BATCH_SIZE, RecvMeta};
 use thiserror::Error;
@@ -633,11 +632,8 @@ mod tests {
         // dropping the handle unregisters the peer and frees the key
         drop(peer_b);
         assert!(tunnel_a.peer(&pk_b).is_none());
-        assert_eq!(sender_b.try_send(Bytes::new()), Err(SendError::PeerRemoved));
-        assert_eq!(
-            sender_b.send(Bytes::new()).await,
-            Err(SendError::PeerRemoved)
-        );
+        assert_eq!(sender_b.try_send(Vec::new()), Err(SendError::PeerRemoved));
+        assert_eq!(sender_b.send(Vec::new()).await, Err(SendError::PeerRemoved));
         let _peer_b = tunnel_a
             .add_peer(&pk_b, PeerConfig::default())
             .await

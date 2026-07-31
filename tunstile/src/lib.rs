@@ -34,7 +34,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-pub use bytes::Bytes;
 use log::debug;
 use thiserror::Error;
 use tokio::{
@@ -80,8 +79,8 @@ pub struct Device {
     peer_updates: Mutex<()>,
     peers: RwLock<HashMap<PublicKey, PeerEntry>>,
     allowed_ips: AllowedIpTable,
-    inbound_tx: mpsc::Sender<Bytes>,
-    inbound_rx: Mutex<mpsc::Receiver<Bytes>>,
+    inbound_tx: mpsc::Sender<Vec<u8>>,
+    inbound_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
 }
 
 impl Drop for Device {
@@ -165,8 +164,7 @@ impl Device {
     /// Routes an outbound IP packet to the peer with the most-specific
     /// matching AllowedIP, waiting for space in that peer's send queue. Invalid
     /// and unroutable packets are dropped and return `Ok(())`.
-    pub async fn send_packet(&self, packet: impl Into<Bytes>) -> Result<(), SendError> {
-        let packet = packet.into();
+    pub async fn send_packet(&self, packet: Vec<u8>) -> Result<(), SendError> {
         let Some(sender) = self.route_packet(&packet) else {
             return Ok(());
         };
@@ -175,8 +173,7 @@ impl Device {
 
     /// Routes an outbound IP packet immediately. A full send queue, invalid
     /// packet, or missing route causes the packet to be dropped and return `Ok(())`.
-    pub fn try_send_packet(&self, packet: impl Into<Bytes>) -> Result<(), SendError> {
-        let packet = packet.into();
+    pub fn try_send_packet(&self, packet: Vec<u8>) -> Result<(), SendError> {
         let Some(sender) = self.route_packet(&packet) else {
             return Ok(());
         };
@@ -196,7 +193,7 @@ impl Device {
     /// Receives the next authenticated inbound IP packet.
     ///
     /// Only one receiver should call this method at a time.
-    pub async fn recv_packet(&self) -> Option<Bytes> {
+    pub async fn recv_packet(&self) -> Option<Vec<u8>> {
         self.inbound_rx.lock().await.recv().await
     }
 
@@ -310,7 +307,7 @@ struct PeerEntry {
     task: JoinHandle<()>,
 }
 
-async fn inbound_loop(inbound: mpsc::Sender<Bytes>, allowed_ips: AllowedIpTable, mut peer: Peer) {
+async fn inbound_loop(inbound: mpsc::Sender<Vec<u8>>, allowed_ips: AllowedIpTable, mut peer: Peer) {
     while let Some(packet) = peer.recv().await {
         let Some(source) = packet_src(&packet) else {
             continue;
@@ -435,12 +432,9 @@ mod tests {
             .await
             .unwrap();
 
-        let a_to_b = Bytes::from(ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]));
-        let b_to_a = Bytes::from(ipv4_packet([10, 0, 0, 2], [10, 0, 0, 1]));
-        assert_eq!(
-            device_a.send_packet(Bytes::from_static(b"invalid")).await,
-            Ok(())
-        );
+        let a_to_b = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]);
+        let b_to_a = ipv4_packet([10, 0, 0, 2], [10, 0, 0, 1]);
+        assert_eq!(device_a.send_packet(b"invalid".to_vec()).await, Ok(()));
         assert_eq!(
             device_a
                 .send_packet(ipv4_packet([10, 0, 0, 1], [10, 0, 0, 3]))
@@ -476,7 +470,7 @@ mod tests {
             .unwrap();
         assert_eq!(device_a.send_packet(a_to_b).await, Ok(()));
 
-        let rerouted = Bytes::from(ipv4_packet([10, 0, 0, 1], [10, 0, 0, 3]));
+        let rerouted = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 3]);
         device_a.send_packet(rerouted.clone()).await.unwrap();
         let received =
             tokio::time::timeout(std::time::Duration::from_secs(5), device_b.recv_packet())
@@ -485,7 +479,7 @@ mod tests {
                 .unwrap();
         assert_eq!(received, rerouted);
 
-        let reconfigured_source = Bytes::from(ipv4_packet([10, 0, 0, 3], [10, 0, 0, 1]));
+        let reconfigured_source = ipv4_packet([10, 0, 0, 3], [10, 0, 0, 1]);
         device_b
             .send_packet(reconfigured_source.clone())
             .await

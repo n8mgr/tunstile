@@ -9,7 +9,6 @@ keywords = ["wireguard", "vpn", "tunnel", "networking"]
 
 [dependencies]
 base64 = "0.22.1"
-bytes = "1.12.1"
 etherparse = "0.20.3"
 futures-core = "0.3.32"
 hex = "0.4.3"

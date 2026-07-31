@@ -8,7 +8,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use bytes::Bytes;
 use log::debug;
 use quinn_udp::BATCH_SIZE;
 use tokio::{
@@ -59,7 +58,7 @@ impl Clock {
 pub(crate) enum PeerAction {
     Connect(SocketAddr),
     SetConfig(PeerConfig),
-    SendData(Bytes),
+    SendData(Vec<u8>),
     RecvData(Vec<u8>, u32, SocketAddr),
     RecvHandshakeInit(Handshake<InitReceived>, SocketAddr),
     RecvHandshakeResp(Vec<u8>, SocketAddr),
@@ -108,13 +107,13 @@ struct PeerActor {
     session: Option<SessionTimers>,
 
     session_tx: watch::Sender<bool>,
-    staged: VecDeque<Bytes>,
+    staged: VecDeque<Vec<u8>>,
 
     socket: Arc<UdpSocket>,
 
     status: Arc<RwLock<PeerStatus>>,
 
-    data_tx: Sender<Bytes>,
+    data_tx: Sender<Vec<u8>>,
 }
 
 impl PeerActor {
@@ -222,8 +221,12 @@ impl PeerActor {
                     Ok(recv) => {
                         let confirmed = recv.confirmed;
                         let unmapped = recv.unmapped;
-                        let payload = (!recv.payload.is_empty())
-                            .then(|| Bytes::copy_from_slice(recv.payload));
+                        let payload_range = recv.payload;
+                        let payload = (!payload_range.is_empty()).then(|| {
+                            debug_assert_eq!(payload_range.start, 0);
+                            data.truncate(payload_range.end);
+                            data
+                        });
                         self.retire_index(unmapped);
                         self.update_status(|status| {
                             status.endpoint = Some(endpoint);
@@ -337,7 +340,7 @@ impl PeerActor {
         }
     }
 
-    fn stage(&mut self, payloads: &mut Vec<Bytes>) {
+    fn stage(&mut self, payloads: &mut Vec<Vec<u8>>) {
         for payload in payloads.drain(..) {
             if self.staged.len() == MAX_STAGED_PACKETS {
                 self.staged.pop_front();
@@ -350,11 +353,11 @@ impl PeerActor {
         if self.staged.is_empty() {
             return;
         }
-        let mut payloads: Vec<Bytes> = self.staged.drain(..).collect();
+        let mut payloads: Vec<Vec<u8>> = self.staged.drain(..).collect();
         self.flush_sends(&mut payloads).await;
     }
 
-    async fn flush_sends(&mut self, payloads: &mut Vec<Bytes>) {
+    async fn flush_sends(&mut self, payloads: &mut Vec<Vec<u8>>) {
         if payloads.is_empty() {
             return;
         }

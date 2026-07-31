@@ -6,7 +6,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use bytes::Bytes;
 use tokio::sync::mpsc::{self, Sender, error::TrySendError};
 use tunstile_protocol::{
     PublicKey,
@@ -145,7 +144,7 @@ impl RoutingTable {
     pub(crate) async fn send_data(
         &self,
         public_key: &PublicKey,
-        packet: Bytes,
+        packet: Vec<u8>,
     ) -> Result<(), SendError> {
         let sender = self
             .peer_key_sender(public_key)
@@ -159,7 +158,7 @@ impl RoutingTable {
     pub(crate) fn try_send_data(
         &self,
         public_key: &PublicKey,
-        packet: Bytes,
+        packet: Vec<u8>,
     ) -> Result<(), SendError> {
         let sender = self
             .peer_key_sender(public_key)
@@ -229,11 +228,11 @@ mod tests {
         assert!(router.bind_index(&public_key, 7));
 
         for _ in 0..PEER_ACTION_QUEUE_CAPACITY {
-            assert_eq!(router.try_send_data(&public_key, Bytes::new()), Ok(()));
+            assert_eq!(router.try_send_data(&public_key, Vec::new()), Ok(()));
         }
 
         assert_eq!(
-            router.try_send_data(&public_key, Bytes::new()),
+            router.try_send_data(&public_key, Vec::new()),
             Err(SendError::Full)
         );
         assert!(!router.recv_data("127.0.0.1:1".parse().unwrap(), 7, Vec::new()));
