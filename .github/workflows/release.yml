@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.head_ref == 'release' && github.event.pull_request.merged == true
+    uses: ./.github/workflows/build.yml
+
+  release:
+    if: github.head_ref == 'release' && github.event.pull_request.merged == true
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+      - name: Download binaries
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          path: binaries
+          merge-multiple: true
+      - name: Package assets
+        run: |
+          mkdir -p release
+          for binary in binaries/*; do
+            name=$(basename "$binary")
+            asset=${name%.exe}.zip
+            zip -qj "release/$asset" "$binary"
+          done
+      - name: Setup Knope
+        uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: knope release --verbose
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_API_KEY }}
+        run: |
+          for crate in tunstile_protocol tunstile_tunnel tunstile; do
+            output=$(cargo publish --locked --package "$crate" --registry crates-io 2>&1) && {
+              echo "Published $crate"
+            } || {
+              if echo "$output" | grep -q "already exists"; then
+                echo "Skipping $crate (already published)"
+              else
+                echo "$output" >&2
+                exit 1
+              fi
+            }
+          done

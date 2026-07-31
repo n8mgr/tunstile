@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Setup Rust
+        run: rustup update stable
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets --all-features
+      - name: Check no_std protocol
+        if: runner.os == 'Linux'
+        run: cargo check --package tunstile_protocol --no-default-features
+      - name: Build docs
+        if: runner.os == 'Linux'
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  wireguard-interop:
+    name: Test kernel WireGuard interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Setup Rust
+        run: rustup update stable
+      - name: Install WireGuard tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 iputils-ping wireguard-tools
+          sudo modprobe wireguard
+      - name: Build tunstile
+        run: cargo build --locked --package tunstile --bin tunstile
+      - name: Test against kernel WireGuard
+        run: testutil/kernel-wireguard-interop.sh target/debug/tunstile
+
+  build:
+    name: Build binaries
+    uses: ./.github/workflows/build.yml
+
+  success:
+    name: success
+    needs: [test, wireguard-interop, build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo success

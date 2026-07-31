@@ -1,0 +1,63 @@
+name: Build binaries
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            os: linux
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            os: linux
+            arch: arm64
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            os: darwin
+            arch: amd64
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            os: darwin
+            arch: arm64
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            os: windows
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Setup Rust
+        shell: bash
+        run: |
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+      - name: Setup musl
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC=musl-gcc" >> "$GITHUB_ENV"
+      - name: Build
+        shell: bash
+        run: cargo build --locked --release --package tunstile --bin tunstile --target ${{ matrix.target }}
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p artifact
+          EXTENSION="${{ matrix.os == 'windows' && '.exe' || '' }}"
+          cp target/${{ matrix.target }}/release/tunstile${EXTENSION} \
+            artifact/tunstile_${{ matrix.os }}_${{ matrix.arch }}${EXTENSION}
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tunstile-${{ matrix.os }}-${{ matrix.arch }}
+          path: artifact/
+          if-no-files-found: error

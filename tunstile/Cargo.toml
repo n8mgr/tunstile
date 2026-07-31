@@ -13,7 +13,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11.11"
 ipnet = "2.12.0"
 log = "0.4.33"
-tunstile_tunnel = { path = "../tunnel" }
+tunstile_tunnel = { version = "0.0.1", path = "../tunnel" }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["net", "rt", "rt-multi-thread", "sync", "macros", "signal"] }
 tun = { version = "0.8.13", features = ["async"] }

@@ -1,0 +1,62 @@
+[changes]
+ignore_conventional_commits = true
+
+[packages.tunstile_protocol]
+versioned_files = [
+    "protocol/Cargo.toml",
+    { path = "tunnel/Cargo.toml", dependency = "tunstile_protocol" },
+    { path = "Cargo.lock", dependency = "tunstile_protocol" }
+]
+changelog = "protocol/CHANGELOG.md"
+
+[packages.tunstile_tunnel]
+versioned_files = [
+    "tunnel/Cargo.toml",
+    { path = "tunstile/Cargo.toml", dependency = "tunstile_tunnel" },
+    { path = "Cargo.lock", dependency = "tunstile_tunnel" }
+]
+changelog = "tunnel/CHANGELOG.md"
+
+[packages.tunstile]
+versioned_files = [
+    "tunstile/Cargo.toml",
+    { path = "Cargo.lock", dependency = "tunstile" }
+]
+changelog = "tunstile/CHANGELOG.md"
+
+[[packages.tunstile.assets]]
+path = "release/tunstile_linux_amd64.zip"
+
+[[packages.tunstile.assets]]
+path = "release/tunstile_linux_arm64.zip"
+
+[[packages.tunstile.assets]]
+path = "release/tunstile_darwin_amd64.zip"
+
+[[packages.tunstile.assets]]
+path = "release/tunstile_darwin_arm64.zip"
+
+[[packages.tunstile.assets]]
+path = "release/tunstile_windows_amd64.zip"
+
+[[workflows]]
+name = "document-change"
+
+[[workflows.steps]]
+type = "CreateChangeFile"
+
+[[workflows]]
+name = "prepare-release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+
+[[workflows]]
+name = "release"
+
+[[workflows.steps]]
+type = "Release"
+
+[github]
+owner = "n8mgr"
+repo = "tunstile"
