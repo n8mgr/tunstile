@@ -54,7 +54,7 @@ const PAYLOAD_LEN: usize = 1420;
 const WIRE_LEN: usize = Transport::packet_len(PAYLOAD_LEN);
 
 fn bench_transport(c: &mut Criterion) {
-    let (t_init, t_resp) = complete_handshake();
+    let (mut t_init, t_resp) = complete_handshake();
 
     let mut group = c.benchmark_group("transport");
     group.throughput(Throughput::Bits((PAYLOAD_LEN * 8) as u64));

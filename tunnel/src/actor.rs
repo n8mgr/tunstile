@@ -117,9 +117,9 @@ struct PeerActor {
 }
 
 impl PeerActor {
-    fn update_status<F>(&self, mut func: F)
+    fn update_status<F>(&self, func: F)
     where
-        F: FnMut(&mut PeerStatus),
+        F: FnOnce(&mut PeerStatus),
     {
         let mut status = self.status.write().unwrap();
         func(&mut status)

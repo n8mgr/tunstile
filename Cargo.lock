@@ -753,12 +753,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-
-[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1402,7 +1396,6 @@ dependencies = [
 name = "tunstile"
 version = "0.0.1"
 dependencies = [
- "base64",
  "clap",
  "env_logger",
  "ipnet",
@@ -1441,7 +1434,6 @@ dependencies = [
  "env_logger",
  "etherparse",
  "futures-core",
- "hex",
  "log",
  "quinn-udp",
  "rand",

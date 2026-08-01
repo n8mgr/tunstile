@@ -48,8 +48,6 @@ pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Above this inbound-handshake rate, [`LoadGuard`] demands a cookie before
 /// CPU is spent on a handshake.
 pub const MAX_HANDSHAKES_PER_SECOND: u32 = 25;
-/// Drivers should rotate the [`LoadGuard`] secret this often.
-pub const COOKIE_SECRET_ROTATION: Duration = Duration::from_secs(120);
 
 /// Error from driving a [`Peer`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -353,7 +351,7 @@ impl Peer {
         };
         let established = pending
             .state
-            .response_received_ref(our_key, self.preshared_key.as_ref(), packet)
+            .response_received(our_key, self.preshared_key.as_ref(), packet)
             .map_err(|_| PeerError::Handshake)?;
         self.pending = None;
         Ok(self.adopt_current(Session::new(established.finish(), now), source))
@@ -382,7 +380,7 @@ impl Peer {
         if self.endpoint.is_none() {
             return Err(PeerError::NoEndpoint);
         }
-        let session = self.current.as_ref().ok_or(PeerError::NoSession)?;
+        let session = self.current.as_mut().ok_or(PeerError::NoSession)?;
         if session.expired(now) {
             return Err(PeerError::Expired);
         }
@@ -466,8 +464,8 @@ pub enum HandshakeDecision {
 /// Responder-side DoS mitigation, owned by whatever reads the socket: cheap
 /// mac1 rejection always, and a cookie challenge (mac2) once the inbound
 /// handshake rate crosses [`MAX_HANDSHAKES_PER_SECOND`]. The driver rotates
-/// the secret every [`COOKIE_SECRET_ROTATION`] via
-/// [`LoadGuard::rotate_secret`].
+/// the secret every [`COOKIE_REFRESH_INTERVAL`](crate::cookies::COOKIE_REFRESH_INTERVAL)
+/// via [`LoadGuard::rotate_secret`].
 pub struct LoadGuard {
     verifier: Verifier,
     secret: [u8; 32],

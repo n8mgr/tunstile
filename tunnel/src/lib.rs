@@ -44,8 +44,9 @@ use tokio::{spawn, task::JoinHandle};
 pub use tunstile_protocol::{KeyParseError, PresharedKey, PrivateKey, PublicKey};
 use tunstile_protocol::{
     MessageHeader,
+    cookies::COOKIE_REFRESH_INTERVAL,
     handshake::Handshake,
-    peer::{COOKIE_SECRET_ROTATION, HandshakeDecision, LoadGuard},
+    peer::{HandshakeDecision, LoadGuard},
 };
 
 mod actor;
@@ -195,7 +196,7 @@ impl Tunnel {
                         MessageHeader::HandshakeInit | MessageHeader::HandshakeResponse { .. }
                     ) {
                         let now = clock.now();
-                        if now.duration_since(secret_rotated) >= COOKIE_SECRET_ROTATION {
+                        if now.duration_since(secret_rotated) >= COOKIE_REFRESH_INTERVAL {
                             guard.rotate_secret(rand::random());
                             secret_rotated = now;
                         }
@@ -216,7 +217,7 @@ impl Tunnel {
                         MessageHeader::HandshakeInit => {
                             match Handshake::receive(&our_private, segment) {
                                 Ok(handshake) => {
-                                    let _ = router.recv_handshake_init(meta.addr, handshake);
+                                    router.recv_handshake_init(meta.addr, handshake);
                                 }
                                 Err(e) => {
                                     debug!(
@@ -227,14 +228,13 @@ impl Tunnel {
                             }
                         }
                         MessageHeader::HandshakeResponse { receiver } => {
-                            let _ =
-                                router.recv_handshake_resp(meta.addr, receiver, segment.to_vec());
+                            router.recv_handshake_resp(meta.addr, receiver, segment.to_vec());
                         }
                         MessageHeader::Data { receiver } => {
-                            let _ = router.recv_data(meta.addr, receiver, segment.to_vec());
+                            router.recv_data(meta.addr, receiver, segment.to_vec());
                         }
                         MessageHeader::CookieReply { receiver } => {
-                            let _ = router.recv_cookie_reply(receiver, segment.to_vec());
+                            router.recv_cookie_reply(receiver, segment.to_vec());
                         }
                     };
                 }
@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(stat.rx_bytes, a_rx);
 
         let payload_b = b"hello from b".to_vec();
-        let payload_b_len = Transport::packet_len(payload_a.len()) as u64;
+        let payload_b_len = Transport::packet_len(payload_b.len()) as u64;
         peer_a.send(payload_b.clone()).await.unwrap();
         let data = peer_b.recv().await;
         assert_eq!(data.unwrap(), payload_b);

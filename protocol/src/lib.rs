@@ -57,9 +57,6 @@ pub enum MessageHeaderParseError {
 
     #[error("invalid message type: {0}")]
     InvalidMessageType(#[from] MessageTypeParseError),
-
-    #[error("invalid peer index")]
-    InvalidPeerIndex,
 }
 
 /// The type and receiver index of a validated WireGuard message, parsed from

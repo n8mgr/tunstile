@@ -17,8 +17,7 @@ use crate::{PeerStatus, SendError, router::RoutingTable};
 /// registration — dropping it removes the peer from the tunnel.
 #[must_use = "dropping the Peer unregisters it from the tunnel"]
 pub struct Peer {
-    public_key: PublicKey,
-    router: Weak<RoutingTable>,
+    sender: PeerSender,
     status: Arc<RwLock<PeerStatus>>,
     session_rx: watch::Receiver<bool>,
     data_rx: mpsc::Receiver<Vec<u8>>,
@@ -26,8 +25,8 @@ pub struct Peer {
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        if let Some(router) = self.router.upgrade() {
-            router.remove_peer(&self.public_key);
+        if let Some(router) = self.sender.router.upgrade() {
+            router.remove_peer(self.sender.public_key());
         }
     }
 }
@@ -41,8 +40,7 @@ impl Peer {
         data_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Self {
         Self {
-            public_key,
-            router,
+            sender: PeerSender { public_key, router },
             status,
             session_rx,
             data_rx,
@@ -51,7 +49,7 @@ impl Peer {
 
     /// This peer's public key.
     pub fn public_key(&self) -> &PublicKey {
-        &self.public_key
+        self.sender.public_key()
     }
 
     /// Current status snapshot for this peer.
@@ -68,22 +66,19 @@ impl Peer {
     /// Sends a payload to this peer, waiting for queue capacity. Pre-session
     /// staging is bounded and may discard older payloads.
     pub async fn send(&self, payload: Vec<u8>) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.send_data(&self.public_key, payload).await
+        self.sender.send(payload).await
     }
 
     /// Sends a payload immediately, returning [`SendError::Full`] instead of
     /// waiting when this peer's queue has no capacity.
     pub fn try_send(&self, payload: Vec<u8>) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.try_send_data(&self.public_key, payload)
+        self.sender.try_send(payload)
     }
 
     /// Updates the peer's endpoint and initiates a handshake if none is in
     /// flight. Use when the peer's address changes, e.g. after a DNS re-resolve.
     pub async fn connect(&self, endpoint: SocketAddr) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.connect(&self.public_key, endpoint).await
+        self.sender.connect(endpoint).await
     }
 
     /// Resolves once a session is established with the peer. Errors if the
@@ -100,10 +95,7 @@ impl Peer {
     /// Returns a cloneable send handle. Unlike the `Peer`, it does not own the
     /// registration: dropping every sender does not remove the peer.
     pub fn sender(&self) -> PeerSender {
-        PeerSender {
-            public_key: self.public_key.clone(),
-            router: self.router.clone(),
-        }
+        self.sender.clone()
     }
 }
 
@@ -143,7 +135,8 @@ impl PeerSender {
         router.try_send_data(&self.public_key, payload)
     }
 
-    /// Updates the peer's endpoint and initiates a handshake if none is pending.
+    /// Updates the peer's endpoint and initiates a handshake if none is in
+    /// flight.
     pub async fn connect(&self, endpoint: SocketAddr) -> Result<(), SendError> {
         let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
         router.connect(&self.public_key, endpoint).await

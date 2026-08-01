@@ -47,7 +47,9 @@ mod allowed_ips;
 mod config;
 pub use config::PeerConfig;
 pub use ipnet::IpNet;
-pub use tunstile_tunnel::{KeyParseError, PeerStatus, PrivateKey, PublicKey, SendError};
+pub use tunstile_tunnel::{
+    KeyParseError, PeerStatus, PresharedKey, PrivateKey, PublicKey, SendError,
+};
 
 type AllowedIpTable = Arc<RwLock<allowed_ips::AllowedIps<PeerSender>>>;
 
@@ -247,21 +249,21 @@ impl Device {
         mut config: PeerConfig,
     ) -> Result<(), DeviceError> {
         let _update = self.peer_updates.lock().await;
-        if !self.peers.read().unwrap().contains_key(public_key) {
-            return Err(DeviceError::UnknownPeer(public_key.clone()));
-        }
+        let sender = self
+            .peers
+            .read()
+            .unwrap()
+            .get(public_key)
+            .map(|entry| entry.sender.clone())
+            .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
 
         let tunnel_config = config.take_tunnel();
         self.tunnel.set_peer(public_key, tunnel_config).await?;
 
-        let peers = self.peers.read().unwrap();
-        let entry = peers
-            .get(public_key)
-            .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
         let mut allowed_ips = self.allowed_ips.write().unwrap();
         allowed_ips.retain(|owner| owner.public_key() != public_key);
         for net in config.allowed_ips {
-            allowed_ips.insert(net, entry.sender.clone());
+            allowed_ips.insert(net, sender.clone());
         }
         Ok(())
     }

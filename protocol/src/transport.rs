@@ -1,9 +1,6 @@
 //! Transport data messages: per-session AEAD and replay protection.
 
-use core::{
-    ops::Range,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::ops::Range;
 use ring::aead::LessSafeKey;
 use thiserror::Error;
 
@@ -96,7 +93,7 @@ pub struct Transport {
 
     recv_aead: LessSafeKey,
     send_aead: LessSafeKey,
-    send_counter: AtomicU64,
+    send_counter: u64,
 }
 
 impl Transport {
@@ -109,11 +106,9 @@ impl Transport {
         Self {
             our_index,
             peer_index,
-
             recv_aead,
-
             send_aead,
-            send_counter: AtomicU64::new(0),
+            send_counter: 0,
         }
     }
 
@@ -123,18 +118,17 @@ impl Transport {
     }
 
     /// Writes an encrypted transport data message to the given buffer.
-    pub fn send(&self, payload: &[u8], buf: &mut [u8]) -> Result<usize, TransportError> {
+    pub fn send(&mut self, payload: &[u8], buf: &mut [u8]) -> Result<usize, TransportError> {
         let len = Self::packet_len(payload.len());
         if buf.len() < len {
             return Err(TransportError::BufferTooSmall { required: len });
         }
         let buf = &mut buf[..len];
-        let counter = self
-            .send_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |counter| {
-                (counter < REJECT_AFTER_MESSAGES).then_some(counter + 1)
-            })
-            .map_err(|_| TransportError::CounterExhausted)?;
+        if self.send_counter >= REJECT_AFTER_MESSAGES {
+            return Err(TransportError::CounterExhausted);
+        }
+        let counter = self.send_counter;
+        self.send_counter += 1;
         buf[0] = MessageType::Data as u8;
         buf[1..4].fill(0);
         buf[DATA_RECEIVER].copy_from_slice(&self.peer_index.to_le_bytes());
@@ -165,29 +159,23 @@ impl Transport {
         {
             return Err(TransportError::InvalidPacket);
         }
-        let receiver = u32::from_le_bytes(
-            packet[DATA_RECEIVER]
-                .try_into()
-                .map_err(|_| TransportError::InvalidPacket)?,
-        );
+        let receiver = u32::from_le_bytes(packet[DATA_RECEIVER].try_into().unwrap());
         if receiver != self.our_index {
             return Err(TransportError::InvalidPacket);
         }
-        let counter = u64::from_le_bytes(
-            packet[DATA_COUNTER]
-                .try_into()
-                .map_err(|_| TransportError::InvalidPacket)?,
-        );
-        let plaintext_len =
-            aead_open_within(&self.recv_aead, counter, &[], packet, DATA_PAYLOAD_OFFSET..)
-                .map_err(|_| TransportError::InvalidPacket)?
-                .len();
-        Ok((counter, 0..plaintext_len))
+        let counter = u64::from_le_bytes(packet[DATA_COUNTER].try_into().unwrap());
+        if !aead_open_within(&self.recv_aead, counter, &[], packet, DATA_PAYLOAD_OFFSET..) {
+            return Err(TransportError::InvalidPacket);
+        }
+        Ok((
+            counter,
+            0..packet.len() - DATA_PAYLOAD_OFFSET - AEAD_TAG_SIZE,
+        ))
     }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use crate::crypto::{Hash256, init_aead};
 
     use super::*;
@@ -236,7 +224,7 @@ mod test {
 
     #[test]
     fn send_is_fallible_and_uses_only_the_required_prefix() {
-        let transport = transport();
+        let mut transport = transport();
         let required = Transport::packet_len(3);
         let mut short = [0u8; Transport::packet_len(3) - 1];
         assert_eq!(
@@ -251,18 +239,13 @@ mod test {
 
     #[test]
     fn send_counter_does_not_wrap() {
-        let transport = transport();
-        transport
-            .send_counter
-            .store(REJECT_AFTER_MESSAGES, Ordering::Relaxed);
+        let mut transport = transport();
+        transport.send_counter = REJECT_AFTER_MESSAGES;
         let mut packet = [0u8; Transport::packet_len(0)];
         assert_eq!(
             transport.send(&[], &mut packet),
             Err(TransportError::CounterExhausted)
         );
-        assert_eq!(
-            transport.send_counter.load(Ordering::Relaxed),
-            REJECT_AFTER_MESSAGES
-        );
+        assert_eq!(transport.send_counter, REJECT_AFTER_MESSAGES);
     }
 }

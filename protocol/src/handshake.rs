@@ -3,7 +3,6 @@
 
 use core::ops::Range;
 
-use ring::aead::{CHACHA20_POLY1305, LessSafeKey, UnboundKey};
 use tai64::Tai64N;
 use thiserror::Error;
 use x25519_dalek::{PublicKey as XPublicKey, ReusableSecret, SharedSecret};
@@ -90,6 +89,7 @@ pub struct InitSent {
 /// Responder state: a valid initiation was received and can be responded to.
 #[derive(ZeroizeOnDrop)]
 pub struct InitReceived {
+    #[zeroize(skip)]
     peer_public: PublicKey,
     ephemeral_public_initiator: XPublicKey,
     index_initiator: u32,
@@ -137,14 +137,9 @@ impl Handshake<InitReceived> {
             return Err(HandshakeError::Failed);
         }
 
-        let sender = u32::from_le_bytes(
-            packet[INIT_SENDER]
-                .try_into()
-                .map_err(|_| HandshakeError::Failed)?,
-        );
-        let ephemeral_public_key = XPublicKey::from(
-            <[u8; 32]>::try_from(&packet[INIT_EPHEMERAL_PK]).map_err(|_| HandshakeError::Failed)?,
-        );
+        let sender = u32::from_le_bytes(packet[INIT_SENDER].try_into().unwrap());
+        let ephemeral_public_key =
+            XPublicKey::from(<[u8; 32]>::try_from(&packet[INIT_EPHEMERAL_PK]).unwrap());
 
         let constr = INITIAL_CONSTR_HASH;
         let our_public = our_private.public_key();
@@ -156,8 +151,9 @@ impl Handshake<InitReceived> {
 
         let static_pk_buf = &mut packet[INIT_ENCRYPTED_STATIC_PK];
         let h_temp = hash(&[h.as_ref(), static_pk_buf]); // hash is computed based on the encrypted bytes
-        aead_open(&init_aead(&key), 0, h.as_ref(), static_pk_buf)
-            .map_err(|_| HandshakeError::Failed)?;
+        if !aead_open(&init_aead(&key), 0, h.as_ref(), static_pk_buf) {
+            return Err(HandshakeError::Failed);
+        }
 
         let mut peer_public = [0u8; 32];
         peer_public.copy_from_slice(&static_pk_buf[..32]);
@@ -169,11 +165,12 @@ impl Handshake<InitReceived> {
 
         let timestamp_buf = &mut packet[INIT_ENCRYPTED_TIMESTAMP];
         let h_temp = hash(&[h.as_ref(), timestamp_buf]); // hash is computed based on the encrypted bytes
-        let timestamp = Tai64N::from_slice(
-            aead_open(&init_aead(&key), 0, h.as_ref(), timestamp_buf)
-                .map_err(|_| HandshakeError::Failed)?,
-        )
-        .map_err(|_| HandshakeError::Failed)?;
+        if !aead_open(&init_aead(&key), 0, h.as_ref(), timestamp_buf) {
+            return Err(HandshakeError::Failed);
+        }
+        let plaintext_len = timestamp_buf.len() - AEAD_TAG_SIZE;
+        let timestamp = Tai64N::from_slice(&timestamp_buf[..plaintext_len])
+            .map_err(|_| HandshakeError::Failed)?;
         let h = h_temp;
 
         Ok(Handshake {
@@ -277,11 +274,7 @@ impl Handshake<InitSent> {
         let h = hash(&[h.as_ref(), ephemeral_public_key.as_ref()]);
         let shared_secret = contributory(ephemeral_secret.diffie_hellman(&peer_public.0))?;
         let [constr, key] = kdf::<2>(constr.as_ref(), shared_secret.as_ref());
-        let aead = LessSafeKey::new(
-            UnboundKey::new(&CHACHA20_POLY1305, key.as_ref())
-                .map_err(|_| ())
-                .expect("encryption failed"),
-        );
+        let aead = init_aead(&key);
 
         let our_public = our_private.public_key();
         buf[INIT_ENCRYPTED_STATIC_PK.start..INIT_ENCRYPTED_STATIC_PK.end - AEAD_TAG_SIZE]
@@ -295,9 +288,7 @@ impl Handshake<InitSent> {
 
         buf[INIT_ENCRYPTED_TIMESTAMP.start..INIT_ENCRYPTED_TIMESTAMP.end - AEAD_TAG_SIZE]
             .copy_from_slice(&timestamp.to_bytes());
-        let aead = LessSafeKey::new(
-            UnboundKey::new(&CHACHA20_POLY1305, key.as_ref()).expect("encryption failed"),
-        );
+        let aead = init_aead(&key);
         aead_seal(&aead, 0, h.as_ref(), &mut buf[INIT_ENCRYPTED_TIMESTAMP]);
 
         let h = hash(&[h.as_ref(), &buf[INIT_ENCRYPTED_TIMESTAMP]]);
@@ -316,19 +307,10 @@ impl Handshake<InitSent> {
         })
     }
 
-    /// Consumes a received handshake response to our initiation, yielding the
+    /// Processes a received handshake response to our initiation, yielding the
     /// established initiator handshake. `our_private` must be the key used to
-    /// create the initiation.
+    /// create the initiation. An invalid response leaves this handshake intact.
     pub fn response_received(
-        self,
-        our_private: &PrivateKey,
-        preshared_key: Option<&PresharedKey>,
-        packet: &mut [u8],
-    ) -> Result<Handshake<InitiatorEstablished>, HandshakeError> {
-        self.response_received_ref(our_private, preshared_key, packet)
-    }
-
-    pub(crate) fn response_received_ref(
         &self,
         our_private: &PrivateKey,
         preshared_key: Option<&PresharedKey>,
@@ -341,19 +323,10 @@ impl Handshake<InitSent> {
             return Err(HandshakeError::Failed);
         }
 
-        let sender = u32::from_le_bytes(
-            packet[RESP_SENDER]
-                .try_into()
-                .map_err(|_| HandshakeError::Failed)?,
-        );
-        let receiver = u32::from_le_bytes(
-            packet[RESP_RECEIVER]
-                .try_into()
-                .map_err(|_| HandshakeError::Failed)?,
-        );
-        let ephemeral_public_key = XPublicKey::from(
-            <[u8; 32]>::try_from(&packet[RESP_EPHEMERAL_PK]).map_err(|_| HandshakeError::Failed)?,
-        );
+        let sender = u32::from_le_bytes(packet[RESP_SENDER].try_into().unwrap());
+        let receiver = u32::from_le_bytes(packet[RESP_RECEIVER].try_into().unwrap());
+        let ephemeral_public_key =
+            XPublicKey::from(<[u8; 32]>::try_from(&packet[RESP_EPHEMERAL_PK]).unwrap());
 
         if receiver != self.state.index_initiator {
             return Err(HandshakeError::Failed);
@@ -376,13 +349,14 @@ impl Handshake<InitSent> {
         let [constr, temp, key] = kdf::<3>(constr.as_ref(), preshared_key.as_ref());
 
         let h = hash(&[h.as_ref(), temp.as_ref()]);
-        aead_open(
+        if !aead_open(
             &init_aead(&key),
             0,
             h.as_ref(),
             &mut packet[RESP_ENCRYPTED_EMPTY_TAG],
-        )
-        .map_err(|_| HandshakeError::Failed)?;
+        ) {
+            return Err(HandshakeError::Failed);
+        }
 
         Ok(Handshake {
             state: InitiatorEstablished {
@@ -425,7 +399,7 @@ impl Handshake<InitiatorEstablished> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     extern crate alloc;
 
     use crate::{cookies::Verifier, transport};
@@ -434,7 +408,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_handshake_e2e() {
+    fn handshake_e2e() {
         const INITIATOR: u32 = 100;
         const RECEIVER: u32 = 200;
 
@@ -483,24 +457,16 @@ mod test {
             .unwrap();
         assert!(cv_resp.verify_mac_1(&resp_msg));
         assert_eq!(resp_msg[0], MessageType::HandshakeResp as u8);
-        assert_eq!(
-            resp_msg[RESP_RECEIVER],
-            INITIATOR.to_le_bytes(),
-            "receiver field should be set to INITIATOR"
-        );
-        assert_eq!(
-            resp_msg[RESP_SENDER],
-            RECEIVER.to_le_bytes(),
-            "sender field should be set to RECEIVER"
-        );
+        assert_eq!(resp_msg[RESP_RECEIVER], INITIATOR.to_le_bytes());
+        assert_eq!(resp_msg[RESP_SENDER], RECEIVER.to_le_bytes());
 
         let h_init = h_init
             .response_received(&sk1, None, &mut resp_msg)
             .expect("valid response");
         assert_eq!(h_init.state.constr, h_resp.state.constr);
 
-        let t_init = h_init.finish();
-        let t_resp = h_resp.finish();
+        let mut t_init = h_init.finish();
+        let mut t_resp = h_resp.finish();
 
         const INITIATOR_DATA: &[u8] = b"Hello, World!";
 
@@ -527,7 +493,7 @@ mod test {
     }
 
     #[test]
-    fn test_precalculated_hash() {
+    fn precalculated_hash() {
         const CONSTRUCTION_STR: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
         const IDENTIFIER_STR: &str = "WireGuard v1 zx2c4 Jason@zx2c4.com";
 

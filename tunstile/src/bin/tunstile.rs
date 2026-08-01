@@ -7,11 +7,10 @@ use std::{
     time::Duration,
 };
 
-use base64::{Engine, prelude::BASE64_STANDARD};
 use clap::Parser;
 use ipnet::IpNet;
 use tun::{AbstractDevice, AsyncDevice};
-use tunstile::{Device, DeviceError, PeerConfig, PrivateKey, PublicKey};
+use tunstile::{Device, DeviceError, PeerConfig, PresharedKey, PrivateKey, PublicKey};
 
 /// Bring up a WireGuard interface from a wg-quick style config file.
 #[derive(Parser)]
@@ -72,7 +71,7 @@ fn fail(msg: String) -> ! {
 struct PeerSection {
     public_key: Option<PublicKey>,
     endpoint: Option<SocketAddr>,
-    preshared_key: Option<[u8; 32]>,
+    preshared_key: Option<PresharedKey>,
     keepalive: Option<u64>,
     allowed_ips: Vec<IpNet>,
 }
@@ -176,7 +175,7 @@ fn parse_config(text: &str) -> Result<ParsedConfig, String> {
                     }
                     "presharedkey" => {
                         peer.preshared_key =
-                            Some(decode_key(value).map_err(|_| at("invalid PresharedKey"))?);
+                            Some(value.parse().map_err(|_| at("invalid PresharedKey"))?);
                     }
                     "endpoint" => {
                         peer.endpoint = Some(resolve(value).map_err(|e| at(&e))?);
@@ -220,18 +219,13 @@ fn parse_config(text: &str) -> Result<ParsedConfig, String> {
             public_key,
             PeerConfig {
                 endpoint: peer.endpoint,
-                preshared_key: peer.preshared_key.map(Into::into),
+                preshared_key: peer.preshared_key,
                 persistent_keepalive: peer.keepalive.map(Duration::from_secs),
                 allowed_ips: peer.allowed_ips,
             },
         ));
     }
     Ok((listen_addr, private_key, tun_config, peer_configs))
-}
-
-fn decode_key(s: &str) -> Result<[u8; 32], ()> {
-    let bytes = BASE64_STANDARD.decode(s).map_err(|_| ())?;
-    <[u8; 32]>::try_from(bytes).map_err(|_| ())
 }
 
 fn resolve(endpoint: &str) -> Result<SocketAddr, String> {

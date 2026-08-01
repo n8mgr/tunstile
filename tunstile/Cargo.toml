@@ -8,7 +8,6 @@ repository = "https://github.com/n8mgr/tunstile"
 keywords = ["wireguard", "vpn", "tunnel", "tun", "networking"]
 
 [dependencies]
-base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11.11"
 ipnet = "2.12.0"

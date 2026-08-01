@@ -34,12 +34,11 @@ impl RoutingTable {
         }
     }
 
-    pub(crate) fn bind_index(&self, peer_key: &PublicKey, index: u32) -> bool {
+    pub(crate) fn bind_index(&self, peer_key: &PublicKey, index: u32) {
         let Some(sender) = self.peer_key_sender(peer_key) else {
-            return false;
+            return;
         };
         self.peer_indices.write().unwrap().insert(index, sender);
-        true
     }
 
     pub(crate) fn retire_index(&self, index: u32) {
@@ -113,18 +112,33 @@ impl RoutingTable {
         self.peer_indices.read().unwrap().get(&index).cloned()
     }
 
-    pub(crate) async fn connect(
+    async fn send_action(
         &self,
         public_key: &PublicKey,
-        endpoint: SocketAddr,
+        action: PeerAction,
     ) -> Result<(), SendError> {
         let sender = self
             .peer_key_sender(public_key)
             .ok_or(SendError::PeerRemoved)?;
         sender
-            .send(PeerAction::Connect(endpoint))
+            .send(action)
             .await
             .map_err(|_| SendError::PeerRemoved)
+    }
+
+    fn try_send_to_index(&self, index: u32, action: PeerAction) {
+        if let Some(sender) = self.peer_index_sender(index) {
+            let _ = sender.try_send(action);
+        }
+    }
+
+    pub(crate) async fn connect(
+        &self,
+        public_key: &PublicKey,
+        endpoint: SocketAddr,
+    ) -> Result<(), SendError> {
+        self.send_action(public_key, PeerAction::Connect(endpoint))
+            .await
     }
 
     pub(crate) async fn set_config(
@@ -132,13 +146,8 @@ impl RoutingTable {
         public_key: &PublicKey,
         config: crate::PeerConfig,
     ) -> Result<(), SendError> {
-        let sender = self
-            .peer_key_sender(public_key)
-            .ok_or(SendError::PeerRemoved)?;
-        sender
-            .send(PeerAction::SetConfig(config))
+        self.send_action(public_key, PeerAction::SetConfig(config))
             .await
-            .map_err(|_| SendError::PeerRemoved)
     }
 
     pub(crate) async fn send_data(
@@ -146,13 +155,8 @@ impl RoutingTable {
         public_key: &PublicKey,
         packet: Vec<u8>,
     ) -> Result<(), SendError> {
-        let sender = self
-            .peer_key_sender(public_key)
-            .ok_or(SendError::PeerRemoved)?;
-        sender
-            .send(PeerAction::SendData(packet))
+        self.send_action(public_key, PeerAction::SendData(packet))
             .await
-            .map_err(|_| SendError::PeerRemoved)
     }
 
     pub(crate) fn try_send_data(
@@ -175,13 +179,10 @@ impl RoutingTable {
         &self,
         endpoint: SocketAddr,
         handshake: Handshake<InitReceived>,
-    ) -> bool {
+    ) {
         if let Some(sender) = self.peer_key_sender(handshake.peer_key()) {
-            return sender
-                .try_send(PeerAction::RecvHandshakeInit(handshake, endpoint))
-                .is_ok();
+            let _ = sender.try_send(PeerAction::RecvHandshakeInit(handshake, endpoint));
         }
-        false
     }
 
     pub(crate) fn recv_handshake_resp(
@@ -189,29 +190,19 @@ impl RoutingTable {
         endpoint: SocketAddr,
         peer_index: u32,
         packet: Vec<u8>,
-    ) -> bool {
-        if let Some(sender) = self.peer_index_sender(peer_index) {
-            return sender
-                .try_send(PeerAction::RecvHandshakeResp(packet, endpoint))
-                .is_ok();
-        }
-        false
+    ) {
+        self.try_send_to_index(peer_index, PeerAction::RecvHandshakeResp(packet, endpoint));
     }
 
-    pub(crate) fn recv_data(&self, endpoint: SocketAddr, peer_index: u32, packet: Vec<u8>) -> bool {
-        if let Some(sender) = self.peer_index_sender(peer_index) {
-            return sender
-                .try_send(PeerAction::RecvData(packet, peer_index, endpoint))
-                .is_ok();
-        }
-        false
+    pub(crate) fn recv_data(&self, endpoint: SocketAddr, peer_index: u32, packet: Vec<u8>) {
+        self.try_send_to_index(
+            peer_index,
+            PeerAction::RecvData(packet, peer_index, endpoint),
+        );
     }
 
-    pub(crate) fn recv_cookie_reply(&self, peer_index: u32, packet: Vec<u8>) -> bool {
-        if let Some(sender) = self.peer_index_sender(peer_index) {
-            return sender.try_send(PeerAction::RecvCookieReply(packet)).is_ok();
-        }
-        false
+    pub(crate) fn recv_cookie_reply(&self, peer_index: u32, packet: Vec<u8>) {
+        self.try_send_to_index(peer_index, PeerAction::RecvCookieReply(packet));
     }
 }
 
@@ -224,8 +215,8 @@ mod tests {
     fn full_peer_queue_does_not_accept_network_input() {
         let router = RoutingTable::new();
         let public_key = PrivateKey::random().public_key();
-        let (_actions, _) = router.register_peer(public_key.clone()).unwrap();
-        assert!(router.bind_index(&public_key, 7));
+        let (mut actions, _) = router.register_peer(public_key.clone()).unwrap();
+        router.bind_index(&public_key, 7);
 
         for _ in 0..PEER_ACTION_QUEUE_CAPACITY {
             assert_eq!(router.try_send_data(&public_key, Vec::new()), Ok(()));
@@ -235,6 +226,13 @@ mod tests {
             router.try_send_data(&public_key, Vec::new()),
             Err(SendError::Full)
         );
-        assert!(!router.recv_data("127.0.0.1:1".parse().unwrap(), 7, Vec::new()));
+        router.recv_data("127.0.0.1:1".parse().unwrap(), 7, Vec::new());
+
+        let mut queued = 0;
+        while let Ok(action) = actions.try_recv() {
+            assert!(matches!(action, PeerAction::SendData(_)));
+            queued += 1;
+        }
+        assert_eq!(queued, PEER_ACTION_QUEUE_CAPACITY);
     }
 }

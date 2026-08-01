@@ -27,7 +27,7 @@ x25519-dalek = { version = "3.0.0", features = ["static_secrets", "reusable_secr
 
 [features]
 default = []
-std = ["thiserror/std", "x25519-dalek/getrandom", "tai64/std", "subtle/std", "ring/std"]
+std = ["base64/std", "thiserror/std", "x25519-dalek/getrandom", "tai64/std", "subtle/std", "ring/std"]
 
 [[bench]]
 name = "handshake"

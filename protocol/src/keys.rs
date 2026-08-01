@@ -38,7 +38,7 @@ fn fmt_key_base64(key: &[u8; 32], f: &mut fmt::Formatter<'_>) -> fmt::Result {
 
 /// A peer public key. Displays and parses as the standard WireGuard base64
 /// encoding.
-#[derive(Clone, ZeroizeOnDrop, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PublicKey(pub(crate) XPublicKey);
 
 impl PublicKey {

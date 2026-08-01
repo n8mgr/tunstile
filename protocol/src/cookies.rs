@@ -10,20 +10,23 @@ use thiserror::Error;
 
 use crate::crypto::{Hash256, hash, mac, xaead_open, xaead_seal};
 use crate::keys::PublicKey;
-use crate::{MAC_SIZE, MessageHeader, MessageType};
+use crate::{AEAD_TAG_SIZE, MAC_SIZE, MessageHeader, MessageType};
 
 const LABEL_MAC_1: &[u8] = b"mac1----";
 const LABEL_COOKIE: &[u8] = b"cookie--";
-const COOKIE_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
+
+/// How long a cookie stays usable, and how often the responder's cookie
+/// secret must be replaced.
+pub const COOKIE_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 
 const COOKIE_SIZE: usize = 16;
 // cookie reply layout: [type(1) | reserved(3) | receiver(4) | nonce(24) | cookie+tag(32)]
 const CR_RECEIVER: Range<usize> = 4..8;
-const CR_NONCE: Range<usize> = 8..32;
-const CR_COOKIE: Range<usize> = 32..32 + COOKIE_SIZE;
-const CR_ENCRYPTED: Range<usize> = 32..64;
+const CR_NONCE: Range<usize> = CR_RECEIVER.end..CR_RECEIVER.end + 24;
+const CR_COOKIE: Range<usize> = CR_NONCE.end..CR_NONCE.end + COOKIE_SIZE;
+const CR_ENCRYPTED: Range<usize> = CR_COOKIE.start..CR_COOKIE.end + AEAD_TAG_SIZE;
 /// Wire length of a cookie reply message.
-pub const COOKIE_REPLY_LENGTH: usize = 64;
+pub const COOKIE_REPLY_LENGTH: usize = CR_ENCRYPTED.end;
 
 /// Error creating or processing a cookie message.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -162,7 +165,7 @@ impl Verifier {
     }
 
     /// The cookie a source address should be presenting, given the current
-    /// rotating secret. Callers rotate `secret` every [`COOKIE_REFRESH_INTERVAL`].
+    /// rotating secret.
     fn cookie(source: &[u8], secret: &[u8; 32]) -> [u8; COOKIE_SIZE] {
         mac(secret, &[source])
     }
@@ -219,7 +222,7 @@ impl Verifier {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
     use crate::{PrivateKey, handshake::INIT_MSG_LENGTH};
 
