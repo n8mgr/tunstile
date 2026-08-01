@@ -29,27 +29,36 @@ route installation is currently implemented only on macOS.
 ## Library
 
 ```rust
-use std::{error::Error, net::SocketAddr};
-use tunstile::{Device, PeerConfig, PrivateKey, PublicKey};
+use std::net::SocketAddr;
+use tunstile::{Device, DeviceConfig, PeerConfig, PrivateKey, PublicKey};
 
 async fn start(
     private_key: PrivateKey,
     peer_key: PublicKey,
     endpoint: SocketAddr,
-) -> Result<Device, Box<dyn Error>> {
-    let device = Device::new("0.0.0.0:0".parse()?, private_key).await?;
+) -> Device {
+    let device = Device::new(
+        "0.0.0.0:0".parse().unwrap(),
+        DeviceConfig {
+            private_key,
+            mtu: None,
+        },
+    )
+    .await
+    .unwrap();
     device
         .add_peer(
             &peer_key,
             PeerConfig {
                 endpoint: Some(endpoint),
-                allowed_ips: vec!["0.0.0.0/0".parse()?],
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
                 ..Default::default()
             },
         )
-        .await?;
+        .await
+        .unwrap();
 
-    Ok(device)
+    device
 }
 ```
 
@@ -61,6 +70,11 @@ Both methods also drop invalid and unroutable packets, returning errors only for
 operational failures. Only one `recv_packet` call may be active at a time.
 Interface addresses and operating-system routes remain the platform
 integration's responsibility.
+
+Set `DeviceConfig::mtu` when the platform interface MTU is known. Outbound IP
+packets are zero-padded according to WireGuard's transport rules without
+exceeding that MTU; inbound padding is removed using the authenticated inner IP
+length.
 
 `Device::set_peer` replaces a registered peer's configuration in place.
 AllowedIPs change atomically, and the peer's protocol state remains intact.

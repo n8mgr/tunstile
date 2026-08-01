@@ -4,26 +4,35 @@
 //! # Example
 //!
 //! ```no_run
-//! use std::{error::Error, net::SocketAddr};
-//! use tunstile::{Device, PeerConfig, PrivateKey, PublicKey};
+//! use std::net::SocketAddr;
+//! use tunstile::{Device, DeviceConfig, PeerConfig, PrivateKey, PublicKey};
 //!
 //! async fn start(
 //!     private_key: PrivateKey,
 //!     peer_key: PublicKey,
 //!     endpoint: SocketAddr,
-//! ) -> Result<Device, Box<dyn Error>> {
-//!     let device = Device::new("0.0.0.0:0".parse()?, private_key).await?;
+//! ) -> Device {
+//!     let device = Device::new(
+//!         "0.0.0.0:0".parse().unwrap(),
+//!         DeviceConfig {
+//!             private_key,
+//!             mtu: None,
+//!         },
+//!     )
+//!     .await
+//!     .unwrap();
 //!     device
 //!         .add_peer(
 //!             &peer_key,
 //!             PeerConfig {
 //!                 endpoint: Some(endpoint),
-//!                 allowed_ips: vec!["0.0.0.0/0".parse()?],
+//!                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
 //!                 ..Default::default()
 //!             },
 //!         )
-//!         .await?;
-//!     Ok(device)
+//!         .await
+//!         .unwrap();
+//!     device
 //! }
 //! ```
 
@@ -41,11 +50,13 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
-use tunstile_tunnel::{Peer, PeerSender, RegisterError, Tunnel};
+use tunstile_tunnel::{
+    MAX_PLAINTEXT_SIZE, Peer, PeerSender, RegisterError, TRANSPORT_PADDING_MULTIPLE, Tunnel,
+};
 
 mod allowed_ips;
 mod config;
-pub use config::PeerConfig;
+pub use config::{DeviceConfig, PeerConfig};
 pub use ipnet::IpNet;
 pub use tunstile_tunnel::{
     KeyParseError, PeerStatus, PresharedKey, PrivateKey, PublicKey, SendError,
@@ -78,6 +89,7 @@ pub enum DeviceError {
 /// interface. Peers remain registered until removed from the device.
 pub struct Device {
     tunnel: Tunnel,
+    max_packet_size: usize,
     peer_updates: Mutex<()>,
     peers: RwLock<HashMap<PublicKey, PeerEntry>>,
     allowed_ips: AllowedIpTable,
@@ -96,10 +108,11 @@ impl Drop for Device {
 }
 
 impl Device {
-    fn start(tunnel: Tunnel) -> Self {
+    fn start(tunnel: Tunnel, max_packet_size: usize) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
         Self {
             tunnel,
+            max_packet_size: max_packet_size.min(MAX_PLAINTEXT_SIZE),
             peer_updates: Mutex::new(()),
             peers: RwLock::new(HashMap::new()),
             allowed_ips: Arc::new(RwLock::new(allowed_ips::AllowedIps::new())),
@@ -109,21 +122,20 @@ impl Device {
     }
 
     /// Binds the UDP socket and creates a device with no peers.
-    pub async fn new(
-        listen_addr: SocketAddr,
-        private_key: PrivateKey,
-    ) -> Result<Self, DeviceError> {
-        let tunnel = Tunnel::new(listen_addr, private_key).await?;
-        Ok(Self::start(tunnel))
+    pub async fn new(listen_addr: SocketAddr, config: DeviceConfig) -> Result<Self, DeviceError> {
+        let max_packet_size = config.mtu.unwrap_or(MAX_PLAINTEXT_SIZE);
+        let tunnel = Tunnel::new(listen_addr, config.private_key).await?;
+        Ok(Self::start(tunnel, max_packet_size))
     }
 
     /// Creates a device using an already-bound UDP socket.
     pub async fn from_socket(
         socket: std::net::UdpSocket,
-        private_key: PrivateKey,
+        config: DeviceConfig,
     ) -> Result<Self, DeviceError> {
-        let tunnel = Tunnel::from_socket(socket, private_key).await?;
-        Ok(Self::start(tunnel))
+        let max_packet_size = config.mtu.unwrap_or(MAX_PLAINTEXT_SIZE);
+        let tunnel = Tunnel::from_socket(socket, config.private_key).await?;
+        Ok(Self::start(tunnel, max_packet_size))
     }
 
     /// This device's public key.
@@ -146,11 +158,20 @@ impl Device {
         self.tunnel.peer(public_key)
     }
 
-    fn route_packet(&self, packet: &[u8]) -> Option<PeerSender> {
-        let Some(destination) = packet_dst(packet) else {
+    fn prepare_outbound_packet(&self, packet: &mut Vec<u8>) -> Option<IpAddr> {
+        let Some(info) = packet_info(packet) else {
             debug!("dropping invalid outbound packet");
             return None;
         };
+        packet.truncate(info.len);
+        if !pad_packet(packet, self.max_packet_size) {
+            debug!("dropping oversized outbound packet");
+            return None;
+        }
+        Some(info.destination)
+    }
+
+    fn peer_for_destination(&self, destination: IpAddr) -> Option<PeerSender> {
         let sender = self
             .allowed_ips
             .read()
@@ -164,19 +185,29 @@ impl Device {
     }
 
     /// Routes an outbound IP packet to the peer with the most-specific
-    /// matching AllowedIP, waiting for space in that peer's send queue. Invalid
-    /// and unroutable packets are dropped and return `Ok(())`.
-    pub async fn send_packet(&self, packet: Vec<u8>) -> Result<(), SendError> {
-        let Some(sender) = self.route_packet(&packet) else {
+    /// matching AllowedIP, waiting for space in that peer's send queue. The IP
+    /// length is validated, trailing bytes are discarded, and the packet is
+    /// zero-padded for WireGuard transport. Invalid, oversized, and unroutable
+    /// packets are dropped and return `Ok(())`.
+    pub async fn send_packet(&self, mut packet: Vec<u8>) -> Result<(), SendError> {
+        let Some(destination) = self.prepare_outbound_packet(&mut packet) else {
+            return Ok(());
+        };
+        let Some(sender) = self.peer_for_destination(destination) else {
             return Ok(());
         };
         sender.send(packet).await
     }
 
-    /// Routes an outbound IP packet immediately. A full send queue, invalid
-    /// packet, or missing route causes the packet to be dropped and return `Ok(())`.
-    pub fn try_send_packet(&self, packet: Vec<u8>) -> Result<(), SendError> {
-        let Some(sender) = self.route_packet(&packet) else {
+    /// Routes an outbound IP packet immediately, applying the same length
+    /// validation and WireGuard padding as [`Device::send_packet`]. A full send
+    /// queue, invalid or oversized packet, or missing route causes the packet
+    /// to be dropped and return `Ok(())`.
+    pub fn try_send_packet(&self, mut packet: Vec<u8>) -> Result<(), SendError> {
+        let Some(destination) = self.prepare_outbound_packet(&mut packet) else {
+            return Ok(());
+        };
+        let Some(sender) = self.peer_for_destination(destination) else {
             return Ok(());
         };
         match sender.try_send(packet) {
@@ -192,7 +223,8 @@ impl Device {
         }
     }
 
-    /// Receives the next authenticated inbound IP packet.
+    /// Receives the next authenticated inbound IP packet after validating its
+    /// declared length and removing WireGuard padding.
     ///
     /// Only one receiver should call this method at a time.
     pub async fn recv_packet(&self) -> Option<Vec<u8>> {
@@ -203,13 +235,13 @@ impl Device {
     pub async fn add_peer(
         &self,
         public_key: &PublicKey,
-        mut config: PeerConfig,
+        config: PeerConfig,
     ) -> Result<(), DeviceError> {
         let _update = self.peer_updates.lock().await;
         if self.peers.read().unwrap().contains_key(public_key) {
             return Err(DeviceError::AlreadyRegistered);
         }
-        let tunnel_config = config.take_tunnel();
+        let (tunnel_config, peer_allowed_ips) = config.take_tunnel();
         let peer = self
             .tunnel
             .add_peer(public_key, tunnel_config)
@@ -220,7 +252,7 @@ impl Device {
         let sender = peer.sender();
         {
             let mut allowed_ips = self.allowed_ips.write().unwrap();
-            for net in config.allowed_ips {
+            for net in peer_allowed_ips {
                 allowed_ips.insert(net, sender.clone());
             }
         }
@@ -246,7 +278,7 @@ impl Device {
     pub async fn set_peer(
         &self,
         public_key: &PublicKey,
-        mut config: PeerConfig,
+        config: PeerConfig,
     ) -> Result<(), DeviceError> {
         let _update = self.peer_updates.lock().await;
         let sender = self
@@ -257,12 +289,12 @@ impl Device {
             .map(|entry| entry.sender.clone())
             .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
 
-        let tunnel_config = config.take_tunnel();
+        let (tunnel_config, peer_allowed_ips) = config.take_tunnel();
         self.tunnel.set_peer(public_key, tunnel_config).await?;
 
         let mut allowed_ips = self.allowed_ips.write().unwrap();
         allowed_ips.retain(|owner| owner.public_key() != public_key);
-        for net in config.allowed_ips {
+        for net in peer_allowed_ips {
             allowed_ips.insert(net, sender.clone());
         }
         Ok(())
@@ -310,17 +342,22 @@ struct PeerEntry {
 }
 
 async fn inbound_loop(inbound: mpsc::Sender<Vec<u8>>, allowed_ips: AllowedIpTable, mut peer: Peer) {
-    while let Some(packet) = peer.recv().await {
-        let Some(source) = packet_src(&packet) else {
+    while let Some(mut packet) = peer.recv().await {
+        let Some(info) = packet_info(&packet) else {
+            debug!("dropping invalid inbound packet");
             continue;
         };
+        packet.truncate(info.len);
         let valid_source = allowed_ips
             .read()
             .unwrap()
-            .longest_match(source)
+            .longest_match(info.source)
             .is_some_and(|sender| sender.public_key() == peer.public_key());
         if !valid_source {
-            debug!("inbound packet from unexpected source {source}; dropping");
+            debug!(
+                "inbound packet from unexpected source {}; dropping",
+                info.source
+            );
             continue;
         }
         if inbound.send(packet).await.is_err() {
@@ -329,22 +366,53 @@ async fn inbound_loop(inbound: mpsc::Sender<Vec<u8>>, allowed_ips: AllowedIpTabl
     }
 }
 
-fn packet_dst(packet: &[u8]) -> Option<IpAddr> {
-    match packet.first()? >> 4 {
-        4 if packet.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(
-            packet[16], packet[17], packet[18], packet[19],
-        ))),
-        6 if packet.len() >= 40 => Some(IpAddr::V6(v6(&packet[24..40]))),
-        _ => None,
-    }
+struct PacketInfo {
+    source: IpAddr,
+    destination: IpAddr,
+    len: usize,
 }
 
-fn packet_src(packet: &[u8]) -> Option<IpAddr> {
-    match packet.first()? >> 4 {
-        4 if packet.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(
-            packet[12], packet[13], packet[14], packet[15],
-        ))),
-        6 if packet.len() >= 40 => Some(IpAddr::V6(v6(&packet[8..24]))),
+fn pad_packet(packet: &mut Vec<u8>, max_packet_size: usize) -> bool {
+    if packet.len() > max_packet_size {
+        return false;
+    }
+    let padded_len = packet.len().next_multiple_of(TRANSPORT_PADDING_MULTIPLE);
+    let padded_len = padded_len.min(max_packet_size);
+    packet.resize(padded_len, 0);
+    true
+}
+
+fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
+    let version = packet.first()? >> 4;
+    match version {
+        4 if packet.len() >= 20 => {
+            let header_len = usize::from(packet[0] & 0x0f) * 4;
+            let len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+            if header_len < 20 || len < header_len || len > packet.len() {
+                return None;
+            }
+            Some(PacketInfo {
+                source: IpAddr::V4(Ipv4Addr::new(
+                    packet[12], packet[13], packet[14], packet[15],
+                )),
+                destination: IpAddr::V4(Ipv4Addr::new(
+                    packet[16], packet[17], packet[18], packet[19],
+                )),
+                len,
+            })
+        }
+        6 if packet.len() >= 40 => {
+            let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+            let len = 40usize.checked_add(payload_len)?;
+            if len > packet.len() {
+                return None;
+            }
+            Some(PacketInfo {
+                source: IpAddr::V6(v6(&packet[8..24])),
+                destination: IpAddr::V6(v6(&packet[24..40])),
+                len,
+            })
+        }
         _ => None,
     }
 }
@@ -359,11 +427,26 @@ fn v6(bytes: &[u8]) -> Ipv6Addr {
 mod tests {
     use super::*;
 
+    fn packet_dst(packet: &[u8]) -> Option<IpAddr> {
+        packet_info(packet).map(|info| info.destination)
+    }
+
+    fn packet_src(packet: &[u8]) -> Option<IpAddr> {
+        packet_info(packet).map(|info| info.source)
+    }
+
     fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
         let mut packet = vec![0x45, 0, 0, 20];
         packet.extend_from_slice(&[0; 8]);
         packet.extend_from_slice(&source);
         packet.extend_from_slice(&destination);
+        packet
+    }
+
+    fn ipv6_packet(source: Ipv6Addr, destination: Ipv6Addr) -> Vec<u8> {
+        let mut packet = vec![0x60, 0, 0, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(&source.octets());
+        packet.extend_from_slice(&destination.octets());
         packet
     }
 
@@ -376,13 +459,60 @@ mod tests {
 
     #[test]
     fn extracts_v6_addresses() {
-        let mut pkt = vec![0x60, 0, 0, 0, 0, 0, 0, 0];
         let src: Ipv6Addr = "fd00::1".parse().unwrap();
         let dst: Ipv6Addr = "fd00::2".parse().unwrap();
-        pkt.extend_from_slice(&src.octets());
-        pkt.extend_from_slice(&dst.octets());
+        let pkt = ipv6_packet(src, dst);
         assert_eq!(packet_src(&pkt), Some(IpAddr::V6(src)));
         assert_eq!(packet_dst(&pkt), Some(IpAddr::V6(dst)));
+    }
+
+    #[test]
+    fn pads_and_trims_ipv4_packets() {
+        let mut original = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]);
+        original.extend_from_slice(b"payload");
+        let original_len = original.len() as u16;
+        original[2..4].copy_from_slice(&original_len.to_be_bytes());
+
+        let mut packet = original.clone();
+        assert!(pad_packet(&mut packet, MAX_PLAINTEXT_SIZE));
+        assert_eq!(packet.len() % TRANSPORT_PADDING_MULTIPLE, 0);
+        assert_eq!(&packet[..original.len()], original);
+        assert!(packet[original.len()..].iter().all(|byte| *byte == 0));
+
+        let info = packet_info(&packet).unwrap();
+        packet.truncate(info.len);
+        assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn pads_and_trims_ipv6_packets() {
+        let src: Ipv6Addr = "fd00::1".parse().unwrap();
+        let dst: Ipv6Addr = "fd00::2".parse().unwrap();
+        let mut original = ipv6_packet(src, dst);
+        original.extend_from_slice(b"payload");
+        original[4..6].copy_from_slice(&7u16.to_be_bytes());
+
+        let mut packet = original.clone();
+        assert!(pad_packet(&mut packet, MAX_PLAINTEXT_SIZE));
+        assert_eq!(packet.len() % TRANSPORT_PADDING_MULTIPLE, 0);
+        assert!(packet[original.len()..].iter().all(|byte| *byte == 0));
+
+        let info = packet_info(&packet).unwrap();
+        packet.truncate(info.len);
+        assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn padding_does_not_exceed_the_inner_mtu() {
+        let mut packet = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]);
+        packet.extend_from_slice(b"payload");
+        packet[2..4].copy_from_slice(&27u16.to_be_bytes());
+
+        assert!(pad_packet(&mut packet, 30));
+        assert_eq!(packet.len(), 30);
+        assert!(packet[27..].iter().all(|byte| *byte == 0));
+
+        assert!(!pad_packet(&mut packet, 26));
     }
 
     #[test]
@@ -390,6 +520,18 @@ mod tests {
         assert_eq!(packet_dst(&[]), None);
         assert_eq!(packet_dst(&[0x45, 0, 0]), None);
         assert_eq!(packet_dst(&[0x25, 0, 0, 0]), None);
+
+        let mut invalid_ihl = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]);
+        invalid_ihl[0] = 0x44;
+        assert!(packet_info(&invalid_ihl).is_none());
+
+        let mut invalid_v4_len = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]);
+        invalid_v4_len[2..4].copy_from_slice(&21u16.to_be_bytes());
+        assert!(packet_info(&invalid_v4_len).is_none());
+
+        let mut invalid_v6_len = ipv6_packet(Ipv6Addr::LOCALHOST, Ipv6Addr::LOCALHOST);
+        invalid_v6_len[4..6].copy_from_slice(&1u16.to_be_bytes());
+        assert!(packet_info(&invalid_v6_len).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -399,12 +541,24 @@ mod tests {
         let private_b = PrivateKey::random();
         let public_b = private_b.public_key();
 
-        let device_a = Device::new("127.0.0.1:0".parse().unwrap(), private_a)
-            .await
-            .unwrap();
-        let device_b = Device::new("127.0.0.1:0".parse().unwrap(), private_b)
-            .await
-            .unwrap();
+        let device_a = Device::new(
+            "127.0.0.1:0".parse().unwrap(),
+            DeviceConfig {
+                private_key: private_a,
+                mtu: None,
+            },
+        )
+        .await
+        .unwrap();
+        let device_b = Device::new(
+            "127.0.0.1:0".parse().unwrap(),
+            DeviceConfig {
+                private_key: private_b,
+                mtu: None,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(device_a.public_key(), public_a);
         assert_eq!(device_b.public_key(), public_b);

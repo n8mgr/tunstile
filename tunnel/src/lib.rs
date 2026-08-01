@@ -41,12 +41,14 @@ use log::debug;
 use quinn_udp::{BATCH_SIZE, RecvMeta};
 use thiserror::Error;
 use tokio::{spawn, task::JoinHandle};
+pub use tunstile_protocol::transport::TRANSPORT_PADDING_MULTIPLE;
 pub use tunstile_protocol::{KeyParseError, PresharedKey, PrivateKey, PublicKey};
 use tunstile_protocol::{
     MessageHeader,
     cookies::COOKIE_REFRESH_INTERVAL,
     handshake::Handshake,
     peer::{HandshakeDecision, LoadGuard},
+    transport::TRANSPORT_OVERHEAD,
 };
 
 mod actor;
@@ -60,6 +62,13 @@ use router::RoutingTable;
 use socket::UdpSocket;
 
 const MAX_MESSAGE_SIZE: usize = 65535;
+const MAX_IPV4_UDP_PAYLOAD_SIZE: usize = 65_507;
+
+/// Largest equal-length, WireGuard-padded plaintext that fits in an IPv4 UDP
+/// datagram after adding the transport header and authentication tag.
+pub const MAX_PLAINTEXT_SIZE: usize = (MAX_IPV4_UDP_PAYLOAD_SIZE - TRANSPORT_OVERHEAD)
+    / TRANSPORT_PADDING_MULTIPLE
+    * TRANSPORT_PADDING_MULTIPLE;
 
 /// Error sending to a peer.
 #[derive(Debug, Error, PartialEq, Eq)]

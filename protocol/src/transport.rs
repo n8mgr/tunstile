@@ -14,6 +14,13 @@ pub(crate) const DATA_RECEIVER: Range<usize> = 4..8;
 pub(crate) const DATA_COUNTER: Range<usize> = DATA_RECEIVER.end..DATA_RECEIVER.end + 8;
 const DATA_PAYLOAD_OFFSET: usize = DATA_COUNTER.end;
 
+/// WireGuard transport packets pad plaintext to this byte multiple when the
+/// interface MTU permits it.
+pub const TRANSPORT_PADDING_MULTIPLE: usize = 16;
+
+/// Bytes added to a plaintext payload by the transport header and AEAD tag.
+pub const TRANSPORT_OVERHEAD: usize = DATA_PAYLOAD_OFFSET + AEAD_TAG_SIZE;
+
 const COUNTER_BLOCK_BITS: u64 = 64;
 const COUNTER_BLOCKS: usize = 128;
 const COUNTER_WINDOW: u64 = (COUNTER_BLOCKS as u64 - 1) * COUNTER_BLOCK_BITS;
@@ -145,7 +152,7 @@ impl Transport {
 
     /// The wire length of a data message carrying `payload_size` bytes.
     pub const fn packet_len(payload_size: usize) -> usize {
-        DATA_PAYLOAD_OFFSET + payload_size + AEAD_TAG_SIZE
+        TRANSPORT_OVERHEAD + payload_size
     }
 
     /// Decrypts a received encrypted transport data message in place,

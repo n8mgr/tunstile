@@ -10,7 +10,9 @@ use std::{
 use clap::Parser;
 use ipnet::IpNet;
 use tun::{AbstractDevice, AsyncDevice};
-use tunstile::{Device, DeviceError, PeerConfig, PresharedKey, PrivateKey, PublicKey};
+use tunstile::{
+    Device, DeviceConfig, DeviceError, PeerConfig, PresharedKey, PrivateKey, PublicKey,
+};
 
 /// Bring up a WireGuard interface from a wg-quick style config file.
 #[derive(Parser)]
@@ -30,9 +32,15 @@ async fn main() {
         .unwrap_or_else(|e| fail(format!("parsing {}: {e}", args.config.display())));
 
     println!("public key: {}", private_key.public_key());
-    let device = Device::new(listen_addr, private_key)
-        .await
-        .unwrap_or_else(|e| fail(format!("creating device: {e}")));
+    let device = Device::new(
+        listen_addr,
+        DeviceConfig {
+            private_key,
+            mtu: Some(tun_config.mtu as usize),
+        },
+    )
+    .await
+    .unwrap_or_else(|e| fail(format!("creating device: {e}")));
     let tun =
         create_tun(&tun_config).unwrap_or_else(|e| fail(format!("bringing up interface: {e}")));
     let tun_name = tun
