@@ -5,11 +5,10 @@ use core::{
 
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::{
-    XChaCha20Poly1305,
-    aead::{self, AeadInOut},
+    ChaCha20Poly1305, XChaCha20Poly1305,
+    aead::{self, AeadInOut, KeyInit},
 };
 use hmac::{Mac, SimpleHmac};
-use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use zeroize::ZeroizeOnDrop;
 
 use crate::AEAD_TAG_SIZE;
@@ -42,35 +41,34 @@ pub(crate) fn hash(input: &[&[u8]]) -> Hash256 {
     Hash256(h.finalize().into())
 }
 
-pub(crate) fn init_aead(key: &Hash256) -> LessSafeKey {
-    LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key.as_ref()).unwrap())
+pub(crate) type AeadKey = ChaCha20Poly1305;
+
+pub(crate) fn init_aead(key: &Hash256) -> AeadKey {
+    AeadKey::new((&key.0).into())
 }
 
 /// Encrypts data using ChaCha20Poly1305 with a given counter and authentication text
 /// The plain text is encrypted in place. `data` must be large enough to hold the 16 byte
 /// authentication tag.
-pub(crate) fn aead_seal(key: &LessSafeKey, counter: u64, auth_text: &[u8], data: &mut [u8]) {
+pub(crate) fn aead_seal(key: &AeadKey, counter: u64, auth_text: &[u8], data: &mut [u8]) {
     if data.len() < AEAD_TAG_SIZE {
         panic!("data must be long enough to append tag")
     }
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
     let plaintext_len = data.len() - AEAD_TAG_SIZE;
+    let (plaintext, tag_out) = data.split_at_mut(plaintext_len);
     let tag = key
-        .seal_in_place_separate_tag(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(auth_text),
-            &mut data[..plaintext_len],
-        )
+        .encrypt_inout_detached(&nonce.into(), auth_text, plaintext.into())
         .unwrap();
-    data[plaintext_len..].copy_from_slice(tag.as_ref());
+    tag_out.copy_from_slice(&tag);
 }
 
 /// Decrypts data using ChaCha20Poly1305 with a given counter and authentication
 /// text. The cipher text is decrypted in place, leaving the plain text in the
 /// first `data.len() - AEAD_TAG_SIZE` bytes. False if authentication fails.
 pub(crate) fn aead_open(
-    key: &LessSafeKey,
+    key: &AeadKey,
     counter: u64,
     auth_text: &[u8],
     cipher_text: &mut [u8],
@@ -81,7 +79,7 @@ pub(crate) fn aead_open(
 /// Decrypts ciphertext at `ciphertext` while writing the plaintext at the
 /// beginning of `data`.
 pub(crate) fn aead_open_within(
-    key: &LessSafeKey,
+    key: &AeadKey,
     counter: u64,
     auth_text: &[u8],
     data: &mut [u8],
@@ -89,14 +87,31 @@ pub(crate) fn aead_open_within(
 ) -> bool {
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
-
-    key.open_within(
-        Nonce::assume_unique_for_key(nonce),
-        Aad::from(auth_text),
-        data,
-        ciphertext,
-    )
-    .is_ok()
+    let start = ciphertext.start;
+    let Some(tag_start) = data.len().checked_sub(AEAD_TAG_SIZE) else {
+        return false;
+    };
+    if start > tag_start {
+        return false;
+    }
+    let Ok(tag) = <[u8; AEAD_TAG_SIZE]>::try_from(&data[tag_start..]) else {
+        return false;
+    };
+    if key
+        .decrypt_inout_detached(
+            &nonce.into(),
+            auth_text,
+            (&mut data[start..tag_start]).into(),
+            &tag.into(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+    if start != 0 {
+        data.copy_within(start..tag_start, 0);
+    }
+    true
 }
 
 /// Encrypts data using XChaCha20Poly1305 with a given nonce and authentication text

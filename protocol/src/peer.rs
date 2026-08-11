@@ -5,19 +5,8 @@
 //! and endpoint roaming. It also enforces the safety rules — an expired
 //! session is unusable and replayed counters are rejected — via the `now`
 //! parameters.
-//!
-//! Liveness is the driver's job: it initiates every handshake (and owns the
-//! retransmit/abandon schedule), decides when to rekey and send keepalives,
-//! and supplies indices, ephemeral secrets, and timestamps at the two calls
-//! that create handshake messages. The spec's timer constants are exported
-//! for drivers; sloppy (second-granularity) scheduling is fine — the spec
-//! itself jitters retransmit timing.
 
-use core::{
-    net::{IpAddr, SocketAddr},
-    ops::Range,
-    time::Duration,
-};
+use core::{net::SocketAddr, ops::Range};
 
 use tai64::Tai64N;
 use thiserror::Error;
@@ -25,29 +14,21 @@ use x25519_dalek::ReusableSecret;
 
 use crate::keys::PresharedKey;
 use crate::{
-    MessageHeader,
-    cookies::{COOKIE_REPLY_LENGTH, Generator, Verifier},
+    cookies::Generator,
     handshake::{self, Handshake, InitReceived, InitSent},
     keys::{PrivateKey, PublicKey},
     time::Instant,
-    transport::{ReplayFilter, Transport},
 };
 
-/// Handshake retransmission interval.
-pub const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
-/// Give up retransmitting a handshake after this long.
-pub const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
-/// An initiator rekeys when sending on a session older than this.
-pub const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
-/// A session refuses to encrypt or decrypt once older than this.
-pub const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
-/// Received data must be answered within this window, with a keepalive if
-/// nothing else.
-pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+mod load;
+mod session;
 
-/// Above this inbound-handshake rate, [`LoadGuard`] demands a cookie before
-/// CPU is spent on a handshake.
-pub const MAX_HANDSHAKES_PER_SECOND: u32 = 25;
+pub use load::{HandshakeDecision, LoadGuard, MAX_HANDSHAKES_PER_SECOND};
+pub use session::{
+    KEEPALIVE_TIMEOUT, REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_AFTER_TIME_RECEIVING,
+    REKEY_ATTEMPT_TIME, REKEY_TIMEOUT, REKEY_TIMEOUT_JITTER_MAX,
+};
+use session::{Session, SessionReceiveError};
 
 /// Error from driving a [`Peer`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -113,26 +94,6 @@ pub struct Recv {
     /// A receiver index that no longer routes to this peer, retired by the
     /// session rotation.
     pub unmapped: Option<u32>,
-}
-
-struct Session {
-    transport: Transport,
-    established: Instant,
-    replay: ReplayFilter,
-}
-
-impl Session {
-    fn new(transport: Transport, now: Instant) -> Self {
-        Self {
-            transport,
-            established: now,
-            replay: ReplayFilter::new(),
-        }
-    }
-
-    fn expired(&self, now: Instant) -> bool {
-        now.duration_since(self.established) >= REJECT_AFTER_TIME
-    }
 }
 
 struct PendingHandshake {
@@ -329,7 +290,7 @@ impl Peer {
         Ok(self
             .next
             .replace(Session::new(transport, now))
-            .map(|old| old.transport.our_index()))
+            .map(|old| old.our_index()))
     }
 
     /// Handles a handshake response to our pending initiation. On success
@@ -367,7 +328,8 @@ impl Peer {
     }
 
     /// Encrypts `payload` as a transport data message into `out` (which must
-    /// hold [`Transport::packet_len`] bytes) and returns the packet length;
+    /// hold [`Transport::packet_len`](crate::transport::Transport::packet_len)
+    /// bytes) and returns the packet length;
     /// send it to [`Peer::endpoint`]. An empty payload is a keepalive.
     /// Returns an error when there is no usable session, no endpoint, the
     /// session or counter has expired, or the output buffer is too small.
@@ -384,16 +346,20 @@ impl Peer {
         if session.expired(now) {
             return Err(PeerError::Expired);
         }
-        session
-            .transport
-            .send(payload, out)
-            .map_err(|error| match error {
-                crate::transport::TransportError::CounterExhausted => PeerError::CounterExhausted,
-                crate::transport::TransportError::BufferTooSmall { required } => {
-                    PeerError::BufferTooSmall { required }
-                }
-                crate::transport::TransportError::InvalidPacket => PeerError::Invalid,
-            })
+        session.send(payload, out).map_err(|error| match error {
+            crate::transport::TransportError::CounterExhausted => PeerError::CounterExhausted,
+            crate::transport::TransportError::BufferTooSmall { required } => {
+                PeerError::BufferTooSmall { required }
+            }
+            crate::transport::TransportError::InvalidPacket => PeerError::Invalid,
+        })
+    }
+
+    /// Whether the current send session reached Rekey-After-Messages.
+    pub fn rekey_due_to_messages(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(Session::rekey_due_to_messages)
     }
 
     /// Decrypts a transport data message addressed to `receiver`. The peer's
@@ -408,7 +374,7 @@ impl Peer {
     ) -> Result<Recv, PeerError> {
         let matches = |s: &Option<Session>| {
             s.as_ref()
-                .is_some_and(|s| s.transport.our_index() == receiver)
+                .is_some_and(|session| session.our_index() == receiver)
         };
         let (session, unconfirmed) = if matches(&self.next) {
             (self.next.as_mut().unwrap(), true)
@@ -422,13 +388,10 @@ impl Peer {
         if session.expired(now) {
             return Err(PeerError::Expired);
         }
-        let (counter, payload) = session
-            .transport
-            .receive(packet)
-            .map_err(|_| PeerError::Invalid)?;
-        if !session.replay.validate(counter) {
-            return Err(PeerError::Replay);
-        }
+        let payload = session.receive(packet).map_err(|error| match error {
+            SessionReceiveError::Invalid => PeerError::Invalid,
+            SessionReceiveError::Replay => PeerError::Replay,
+        })?;
         self.endpoint = Some(source);
         let mut unmapped = None;
         if unconfirmed {
@@ -447,115 +410,16 @@ impl Peer {
         let old = core::mem::replace(&mut self.previous, self.current.take());
         self.current = Some(session);
         self.endpoint = Some(endpoint);
-        old.map(|old| old.transport.our_index())
+        old.map(|old| old.our_index())
     }
-}
-
-/// What to do with an inbound handshake message, from [`LoadGuard::check`].
-pub enum HandshakeDecision {
-    /// Process the handshake.
-    Process,
-    /// Discard it.
-    Drop,
-    /// Send this cookie challenge back instead of processing it.
-    Cookie([u8; COOKIE_REPLY_LENGTH]),
-}
-
-/// Responder-side DoS mitigation, owned by whatever reads the socket: cheap
-/// mac1 rejection always, and a cookie challenge (mac2) once the inbound
-/// handshake rate crosses [`MAX_HANDSHAKES_PER_SECOND`]. The driver rotates
-/// the secret every [`COOKIE_REFRESH_INTERVAL`](crate::cookies::COOKIE_REFRESH_INTERVAL)
-/// via [`LoadGuard::rotate_secret`].
-pub struct LoadGuard {
-    verifier: Verifier,
-    secret: [u8; 32],
-    window_start: Instant,
-    handshakes: u32,
-}
-
-impl LoadGuard {
-    /// A guard for handshakes addressed to `our_public`, with an initial
-    /// cookie secret.
-    pub fn new(our_public: &PublicKey, secret: [u8; 32]) -> Self {
-        Self {
-            verifier: Verifier::new(our_public),
-            secret,
-            window_start: Instant::from_millis(0),
-            handshakes: 0,
-        }
-    }
-
-    /// Replaces the rotating cookie secret.
-    pub fn rotate_secret(&mut self, secret: [u8; 32]) {
-        self.secret = secret;
-    }
-
-    /// Checks an inbound handshake message. `nonce` is used only if a cookie
-    /// reply is issued. `force_under_load` skips the rate threshold and
-    /// always demands a cookie.
-    pub fn check(
-        &mut self,
-        now: Instant,
-        msg: &[u8],
-        source: SocketAddr,
-        nonce: [u8; 24],
-        force_under_load: bool,
-    ) -> HandshakeDecision {
-        if !matches!(
-            MessageHeader::try_from(msg),
-            Ok(MessageHeader::HandshakeInit | MessageHeader::HandshakeResponse { .. })
-        ) || !self.verifier.verify_mac_1(msg)
-        {
-            return HandshakeDecision::Drop;
-        }
-        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
-            self.window_start = now;
-            self.handshakes = 0;
-        }
-        self.handshakes += 1;
-
-        let under_load = force_under_load || self.handshakes > MAX_HANDSHAKES_PER_SECOND;
-        if !under_load {
-            return HandshakeDecision::Process;
-        }
-        let (source, len) = source_bytes(source);
-        let source = &source[..len];
-        if self.verifier.verify_mac_2(msg, source, &self.secret) {
-            return HandshakeDecision::Process;
-        }
-        let mut reply = [0u8; COOKIE_REPLY_LENGTH];
-        if self
-            .verifier
-            .write_cookie_reply(msg, source, &self.secret, nonce, &mut reply)
-            .is_err()
-        {
-            return HandshakeDecision::Drop;
-        }
-        HandshakeDecision::Cookie(reply)
-    }
-}
-
-fn source_bytes(addr: SocketAddr) -> ([u8; 18], usize) {
-    let mut bytes = [0u8; 18];
-    let ip_len = match addr.ip() {
-        IpAddr::V4(ip) => {
-            bytes[..4].copy_from_slice(&ip.octets());
-            4
-        }
-        IpAddr::V6(ip) => {
-            bytes[..16].copy_from_slice(&ip.octets());
-            16
-        }
-    };
-    bytes[ip_len..ip_len + 2].copy_from_slice(&addr.port().to_be_bytes());
-    (bytes, ip_len + 2)
 }
 
 #[cfg(test)]
 mod tests {
-    use core::net::Ipv4Addr;
+    use core::net::{IpAddr, Ipv4Addr};
 
     use super::*;
+    use crate::transport::Transport;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -668,7 +532,6 @@ mod tests {
         let start = ms(0);
         let (mut a, mut b) = established_pair(start);
 
-        // a packet encrypted in time is rejected once the session expires
         let mut buf = [0u8; Transport::packet_len(4)];
         let len = a.encrypt(start, b"late", &mut buf).unwrap();
         let receiver = receiver_index(&buf[..len]);
@@ -678,7 +541,6 @@ mod tests {
             Some(PeerError::Expired)
         );
 
-        // and the expired session refuses to encrypt
         assert_eq!(
             a.encrypt(expiry, b"late", &mut buf),
             Err(PeerError::Expired)
@@ -753,86 +615,5 @@ mod tests {
                 .err(),
             Some(PeerError::StaleTimestamp)
         );
-    }
-
-    // A forced-under-load guard cookies the first init; after cookie_reply
-    // the retransmitted init carries a valid mac2 and passes.
-    #[test]
-    fn cookie_round_trip_under_load() {
-        let now = ms(0);
-        let a_key = PrivateKey::random();
-        let b_key = PrivateKey::random();
-        let mut a = Peer::new(b_key.public_key());
-        let mut guard = LoadGuard::new(&b_key.public_key(), [42u8; 32]);
-        a.set_endpoint(addr(2));
-
-        let mut init = [0u8; handshake::INIT_MSG_LENGTH];
-        a.initiate(&a_key, values(1), &mut init).unwrap();
-        let reply = match guard.check(now, &init, addr(1), [7u8; 24], true) {
-            HandshakeDecision::Cookie(reply) => reply,
-            _ => panic!("expected a cookie challenge"),
-        };
-
-        a.cookie_reply(&reply, Tai64N::UNIX_EPOCH)
-            .expect("valid cookie reply");
-        a.initiate(&a_key, values(2), &mut init).unwrap();
-        assert!(matches!(
-            guard.check(now, &init, addr(1), [8u8; 24], true),
-            HandshakeDecision::Process
-        ));
-    }
-
-    #[test]
-    fn cookie_reply_to_response_applies_to_next_response() {
-        let now = ms(0);
-        let a_key = PrivateKey::random();
-        let b_key = PrivateKey::random();
-        let mut a = Peer::new(b_key.public_key());
-        let mut b = Peer::new(a_key.public_key());
-        let mut guard = LoadGuard::new(&a_key.public_key(), [42u8; 32]);
-        a.set_endpoint(addr(2));
-
-        let mut init = [0u8; handshake::INIT_MSG_LENGTH];
-        a.initiate(&a_key, values(1), &mut init).unwrap();
-        let received = Handshake::receive(&b_key, &mut init).unwrap();
-        let mut response = [0u8; handshake::RESP_MSG_LENGTH];
-        b.respond(now, received, values(2), addr(1), &mut response)
-            .unwrap();
-
-        let reply = match guard.check(now, &response, addr(2), [7u8; 24], true) {
-            HandshakeDecision::Cookie(reply) => reply,
-            _ => panic!("expected a cookie challenge"),
-        };
-        b.cookie_reply(&reply, Tai64N::UNIX_EPOCH)
-            .expect("response cookie must not require a pending initiation");
-
-        let later = Tai64N::UNIX_EPOCH + Duration::from_secs(1);
-        a.initiate(
-            &a_key,
-            HandshakeValues {
-                index: 3,
-                ephemeral_secret: ReusableSecret::random(),
-                timestamp: later,
-            },
-            &mut init,
-        )
-        .unwrap();
-        let received = Handshake::receive(&b_key, &mut init).unwrap();
-        b.respond(
-            now,
-            received,
-            HandshakeValues {
-                index: 4,
-                ephemeral_secret: ReusableSecret::random(),
-                timestamp: later,
-            },
-            addr(1),
-            &mut response,
-        )
-        .unwrap();
-        assert!(matches!(
-            guard.check(now, &response, addr(2), [8u8; 24], true),
-            HandshakeDecision::Process
-        ));
     }
 }

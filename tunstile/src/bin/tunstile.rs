@@ -80,7 +80,7 @@ struct PeerSection {
     public_key: Option<PublicKey>,
     endpoint: Option<SocketAddr>,
     preshared_key: Option<PresharedKey>,
-    keepalive: Option<u64>,
+    keepalive: Option<Duration>,
     allowed_ips: Vec<IpNet>,
 }
 
@@ -199,11 +199,15 @@ fn parse_config(text: &str) -> Result<ParsedConfig, String> {
                         }
                     }
                     "persistentkeepalive" => {
-                        peer.keepalive = Some(
-                            value
-                                .parse()
-                                .map_err(|_| at("invalid PersistentKeepalive"))?,
-                        );
+                        let value = value
+                            .parse()
+                            .map_err(|_| at("invalid PersistentKeepalive"))?;
+                        if value == 0 || value >= 65535 {
+                            return Err(
+                                "persistentkeepalive must be between 0 and 65535".to_string()
+                            );
+                        }
+                        peer.keepalive = Some(Duration::from_secs(value));
                     }
                     _ => {}
                 }
@@ -228,7 +232,7 @@ fn parse_config(text: &str) -> Result<ParsedConfig, String> {
             PeerConfig {
                 endpoint: peer.endpoint,
                 preshared_key: peer.preshared_key,
-                persistent_keepalive: peer.keepalive.map(Duration::from_secs),
+                persistent_keepalive: peer.keepalive,
                 allowed_ips: peer.allowed_ips,
             },
         ));

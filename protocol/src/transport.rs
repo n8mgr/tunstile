@@ -1,12 +1,11 @@
 //! Transport data messages: per-session AEAD and replay protection.
 
 use core::ops::Range;
-use ring::aead::LessSafeKey;
 use thiserror::Error;
 
 use crate::{
     AEAD_TAG_SIZE, MessageType,
-    crypto::{aead_open_within, aead_seal},
+    crypto::{AeadKey, aead_open_within, aead_seal},
 };
 
 // data msg wire layout: [type(1) | reserved(3) | receiver(4) | counter(8) | payload+tag(...)]
@@ -27,6 +26,9 @@ const COUNTER_WINDOW: u64 = (COUNTER_BLOCKS as u64 - 1) * COUNTER_BLOCK_BITS;
 
 /// Reject-After-Messages from the WireGuard spec: 2^64 − 2^13 − 1.
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
+
+/// Rekey-After-Messages from the WireGuard spec: 2^60.
+pub const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
 
 /// Error encrypting or decrypting a transport data message.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -98,8 +100,8 @@ pub struct Transport {
     our_index: u32,
     peer_index: u32,
 
-    recv_aead: LessSafeKey,
-    send_aead: LessSafeKey,
+    recv_aead: AeadKey,
+    send_aead: AeadKey,
     send_counter: u64,
 }
 
@@ -107,8 +109,8 @@ impl Transport {
     pub(crate) fn new(
         our_index: u32,
         peer_index: u32,
-        recv_aead: LessSafeKey,
-        send_aead: LessSafeKey,
+        recv_aead: AeadKey,
+        send_aead: AeadKey,
     ) -> Self {
         Self {
             our_index,
@@ -122,6 +124,10 @@ impl Transport {
     /// Our receiver index for this session, as the peer addresses it.
     pub fn our_index(&self) -> u32 {
         self.our_index
+    }
+
+    pub(crate) fn rekey_due(&self) -> bool {
+        self.send_counter >= REKEY_AFTER_MESSAGES
     }
 
     /// Writes an encrypted transport data message to the given buffer.
@@ -254,5 +260,16 @@ mod tests {
             Err(TransportError::CounterExhausted)
         );
         assert_eq!(transport.send_counter, REJECT_AFTER_MESSAGES);
+    }
+
+    #[test]
+    fn rekeys_after_the_message_limit() {
+        let mut transport = transport();
+        transport.send_counter = REKEY_AFTER_MESSAGES - 1;
+        assert!(!transport.rekey_due());
+
+        let mut packet = [0u8; Transport::packet_len(0)];
+        transport.send(&[], &mut packet).unwrap();
+        assert!(transport.rekey_due());
     }
 }

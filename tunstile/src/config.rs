@@ -14,15 +14,6 @@ pub struct DeviceConfig {
     pub mtu: Option<usize>,
 }
 
-impl DeviceConfig {
-    pub fn new(private_key: PrivateKey) -> Self {
-        Self {
-            private_key,
-            mtu: None,
-        }
-    }
-}
-
 /// Optional settings and allowed IP prefixes for a peer.
 #[derive(Clone, Debug, Default)]
 pub struct PeerConfig {
