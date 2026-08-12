@@ -45,11 +45,7 @@ use std::{
 
 use log::debug;
 use thiserror::Error;
-use tokio::{
-    spawn,
-    sync::{Mutex, mpsc},
-    task::JoinHandle,
-};
+use tokio::{spawn, sync::mpsc, task::JoinHandle};
 use tunstile_tunnel::{
     MAX_PLAINTEXT_SIZE, Peer, PeerSender, RegisterError, TRANSPORT_PADDING_MULTIPLE, Tunnel,
 };
@@ -90,19 +86,16 @@ pub enum DeviceError {
 pub struct Device {
     tunnel: Tunnel,
     max_packet_size: usize,
-    peer_updates: Mutex<()>,
-    peers: RwLock<HashMap<PublicKey, PeerEntry>>,
+    peers: HashMap<PublicKey, PeerEntry>,
     allowed_ips: AllowedIpTable,
     inbound_tx: mpsc::Sender<Vec<u8>>,
-    inbound_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    inbound_rx: mpsc::Receiver<Vec<u8>>,
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if let Ok(peers) = self.peers.get_mut() {
-            for entry in peers.values() {
-                entry.task.abort();
-            }
+        for (_, entry) in self.peers.drain() {
+            entry.task.abort();
         }
     }
 }
@@ -113,11 +106,10 @@ impl Device {
         Self {
             tunnel,
             max_packet_size: max_packet_size.min(MAX_PLAINTEXT_SIZE),
-            peer_updates: Mutex::new(()),
-            peers: RwLock::new(HashMap::new()),
+            peers: HashMap::new(),
             allowed_ips: Arc::new(RwLock::new(allowed_ips::AllowedIps::new())),
             inbound_tx,
-            inbound_rx: Mutex::new(inbound_rx),
+            inbound_rx,
         }
     }
 
@@ -227,18 +219,17 @@ impl Device {
     /// declared length and removing WireGuard padding.
     ///
     /// Only one receiver should call this method at a time.
-    pub async fn recv_packet(&self) -> Option<Vec<u8>> {
-        self.inbound_rx.lock().await.recv().await
+    pub async fn recv_packet(&mut self) -> Option<Vec<u8>> {
+        self.inbound_rx.recv().await
     }
 
     /// Registers a peer and its AllowedIPs.
     pub async fn add_peer(
-        &self,
+        &mut self,
         public_key: &PublicKey,
         config: PeerConfig,
     ) -> Result<(), DeviceError> {
-        let _update = self.peer_updates.lock().await;
-        if self.peers.read().unwrap().contains_key(public_key) {
+        if self.peers.contains_key(public_key) {
             return Err(DeviceError::AlreadyRegistered);
         }
         let (tunnel_config, peer_allowed_ips) = config.take_tunnel();
@@ -263,8 +254,6 @@ impl Device {
         ));
         let previous = self
             .peers
-            .write()
-            .unwrap()
             .insert(public_key.clone(), PeerEntry { sender, task });
         debug_assert!(previous.is_none());
         Ok(())
@@ -276,15 +265,12 @@ impl Device {
     /// it alone. `None` clears the pre-shared key or disables persistent
     /// keepalive; an empty `allowed_ips` removes all of the peer's routes.
     pub async fn set_peer(
-        &self,
+        &mut self,
         public_key: &PublicKey,
         config: PeerConfig,
     ) -> Result<(), DeviceError> {
-        let _update = self.peer_updates.lock().await;
         let sender = self
             .peers
-            .read()
-            .unwrap()
             .get(public_key)
             .map(|entry| entry.sender.clone())
             .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
@@ -307,11 +293,8 @@ impl Device {
         public_key: &PublicKey,
         endpoint: SocketAddr,
     ) -> Result<(), DeviceError> {
-        let _update = self.peer_updates.lock().await;
         let sender = self
             .peers
-            .read()
-            .unwrap()
             .get(public_key)
             .map(|entry| entry.sender.clone())
             .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
@@ -320,9 +303,8 @@ impl Device {
     }
 
     /// Unregisters a peer and removes its AllowedIPs.
-    pub async fn remove_peer(&self, public_key: &PublicKey) -> bool {
-        let _update = self.peer_updates.lock().await;
-        let entry = self.peers.write().unwrap().remove(public_key);
+    pub async fn remove_peer(&mut self, public_key: &PublicKey) -> bool {
+        let entry = self.peers.remove(public_key);
         let Some(entry) = entry else {
             return false;
         };
@@ -541,7 +523,7 @@ mod tests {
         let private_b = PrivateKey::random();
         let public_b = private_b.public_key();
 
-        let device_a = Device::new(
+        let mut device_a = Device::new(
             "127.0.0.1:0".parse().unwrap(),
             DeviceConfig {
                 private_key: private_a,
@@ -550,7 +532,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let device_b = Device::new(
+        let mut device_b = Device::new(
             "127.0.0.1:0".parse().unwrap(),
             DeviceConfig {
                 private_key: private_b,

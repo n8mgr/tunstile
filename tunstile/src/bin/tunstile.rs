@@ -32,7 +32,7 @@ async fn main() {
         .unwrap_or_else(|e| fail(format!("parsing {}: {e}", args.config.display())));
 
     println!("public key: {}", private_key.public_key());
-    let device = Device::new(
+    let mut device = Device::new(
         listen_addr,
         DeviceConfig {
             private_key,
@@ -62,7 +62,7 @@ async fn main() {
     println!("{tun_name} up with {peer_count} peer(s); ctrl-c to stop");
 
     tokio::select! {
-        result = run_packets(&device, &tun, tun_config.mtu as usize) => match result {
+        result = run_packets(&mut device, &tun, tun_config.mtu as usize) => match result {
             Ok(()) => println!("packet interface closed"),
             Err(error) => fail(format!("packet interface: {error}")),
         },
@@ -106,7 +106,11 @@ async fn recv_tun(tun: &AsyncDevice, mtu: usize) -> io::Result<Vec<u8>> {
     Ok(packet)
 }
 
-async fn run_packets(device: &Device, tun: &AsyncDevice, mtu: usize) -> Result<(), DeviceError> {
+async fn run_packets(
+    device: &mut Device,
+    tun: &AsyncDevice,
+    mtu: usize,
+) -> Result<(), DeviceError> {
     let recv = recv_tun(tun, mtu);
     tokio::pin!(recv);
     loop {
