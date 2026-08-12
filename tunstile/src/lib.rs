@@ -12,7 +12,7 @@
 //!     peer_key: PublicKey,
 //!     endpoint: SocketAddr,
 //! ) -> Device {
-//!     let device = Device::new(
+//!     let mut device = Device::new(
 //!         "0.0.0.0:0".parse().unwrap(),
 //!         DeviceConfig {
 //!             private_key,
@@ -40,7 +40,6 @@ use std::{
     collections::HashMap,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{Arc, RwLock},
 };
 
 use log::debug;
@@ -57,8 +56,6 @@ pub use ipnet::IpNet;
 pub use tunstile_tunnel::{
     KeyParseError, PeerStatus, PresharedKey, PrivateKey, PublicKey, SendError,
 };
-
-type AllowedIpTable = Arc<RwLock<allowed_ips::AllowedIps<PeerSender>>>;
 
 const PACKET_QUEUE_CAPACITY: usize = 1024;
 
@@ -87,9 +84,9 @@ pub struct Device {
     tunnel: Tunnel,
     max_packet_size: usize,
     peers: HashMap<PublicKey, PeerEntry>,
-    allowed_ips: AllowedIpTable,
-    inbound_tx: mpsc::Sender<Vec<u8>>,
-    inbound_rx: mpsc::Receiver<Vec<u8>>,
+    allowed_ips: allowed_ips::AllowedIps<PeerSender>,
+    inbound_tx: mpsc::Sender<(PublicKey, Vec<u8>)>,
+    inbound_rx: mpsc::Receiver<(PublicKey, Vec<u8>)>,
 }
 
 impl Drop for Device {
@@ -107,7 +104,7 @@ impl Device {
             tunnel,
             max_packet_size: max_packet_size.min(MAX_PLAINTEXT_SIZE),
             peers: HashMap::new(),
-            allowed_ips: Arc::new(RwLock::new(allowed_ips::AllowedIps::new())),
+            allowed_ips: allowed_ips::AllowedIps::new(),
             inbound_tx,
             inbound_rx,
         }
@@ -164,12 +161,7 @@ impl Device {
     }
 
     fn peer_for_destination(&self, destination: IpAddr) -> Option<PeerSender> {
-        let sender = self
-            .allowed_ips
-            .read()
-            .unwrap()
-            .longest_match(destination)
-            .cloned();
+        let sender = self.allowed_ips.longest_match(destination).cloned();
         if sender.is_none() {
             debug!("dropping outbound packet: no peer allows destination {destination}");
         }
@@ -216,11 +208,29 @@ impl Device {
     }
 
     /// Receives the next authenticated inbound IP packet after validating its
-    /// declared length and removing WireGuard padding.
-    ///
-    /// Only one receiver should call this method at a time.
+    /// declared length, removing WireGuard padding, and checking that its
+    /// source address routes back to the delivering peer.
     pub async fn recv_packet(&mut self) -> Option<Vec<u8>> {
-        self.inbound_rx.recv().await
+        loop {
+            let (public_key, mut packet) = self.inbound_rx.recv().await?;
+            let Some(info) = packet_info(&packet) else {
+                debug!("dropping invalid inbound packet");
+                continue;
+            };
+            packet.truncate(info.len);
+            let valid_source = self
+                .allowed_ips
+                .longest_match(info.source)
+                .is_some_and(|sender| *sender.public_key() == public_key);
+            if !valid_source {
+                debug!(
+                    "inbound packet from unexpected source {}; dropping",
+                    info.source
+                );
+                continue;
+            }
+            return Some(packet);
+        }
     }
 
     /// Registers a peer and its AllowedIPs.
@@ -241,17 +251,10 @@ impl Device {
                 RegisterError::AlreadyRegistered => DeviceError::AlreadyRegistered,
             })?;
         let sender = peer.sender();
-        {
-            let mut allowed_ips = self.allowed_ips.write().unwrap();
-            for net in peer_allowed_ips {
-                allowed_ips.insert(net, sender.clone());
-            }
+        for net in peer_allowed_ips {
+            self.allowed_ips.insert(net, sender.clone());
         }
-        let task = spawn(inbound_loop(
-            self.inbound_tx.clone(),
-            self.allowed_ips.clone(),
-            peer,
-        ));
+        let task = spawn(inbound_loop(self.inbound_tx.clone(), peer));
         let previous = self
             .peers
             .insert(public_key.clone(), PeerEntry { sender, task });
@@ -278,10 +281,10 @@ impl Device {
         let (tunnel_config, peer_allowed_ips) = config.take_tunnel();
         self.tunnel.set_peer(public_key, tunnel_config).await?;
 
-        let mut allowed_ips = self.allowed_ips.write().unwrap();
-        allowed_ips.retain(|owner| owner.public_key() != public_key);
+        self.allowed_ips
+            .retain(|owner| owner.public_key() != public_key);
         for net in peer_allowed_ips {
-            allowed_ips.insert(net, sender.clone());
+            self.allowed_ips.insert(net, sender.clone());
         }
         Ok(())
     }
@@ -309,8 +312,6 @@ impl Device {
             return false;
         };
         self.allowed_ips
-            .write()
-            .unwrap()
             .retain(|sender| sender.public_key() != public_key);
         entry.task.abort();
         let _ = entry.task.await;
@@ -323,26 +324,10 @@ struct PeerEntry {
     task: JoinHandle<()>,
 }
 
-async fn inbound_loop(inbound: mpsc::Sender<Vec<u8>>, allowed_ips: AllowedIpTable, mut peer: Peer) {
-    while let Some(mut packet) = peer.recv().await {
-        let Some(info) = packet_info(&packet) else {
-            debug!("dropping invalid inbound packet");
-            continue;
-        };
-        packet.truncate(info.len);
-        let valid_source = allowed_ips
-            .read()
-            .unwrap()
-            .longest_match(info.source)
-            .is_some_and(|sender| sender.public_key() == peer.public_key());
-        if !valid_source {
-            debug!(
-                "inbound packet from unexpected source {}; dropping",
-                info.source
-            );
-            continue;
-        }
-        if inbound.send(packet).await.is_err() {
+async fn inbound_loop(inbound: mpsc::Sender<(PublicKey, Vec<u8>)>, mut peer: Peer) {
+    let public_key = peer.public_key().clone();
+    while let Some(packet) = peer.recv().await {
+        if inbound.send((public_key.clone(), packet)).await.is_err() {
             break;
         }
     }
