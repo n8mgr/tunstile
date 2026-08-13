@@ -7,7 +7,7 @@
 //! parameters: elapsed time on the driver's monotonic clock, measured from
 //! an arbitrary epoch of its choosing.
 
-use core::{net::SocketAddr, ops::Range};
+use core::net::SocketAddr;
 
 use tai64::Tai64N;
 use thiserror::Error;
@@ -84,9 +84,9 @@ pub struct HandshakeValues {
 
 /// A decrypted transport message from [`Peer::decrypt`].
 pub struct Recv {
-    /// The plaintext range within the packet passed to [`Peer::decrypt`]. It
-    /// is empty for a keepalive.
-    pub payload: Range<usize>,
+    /// The length of the plaintext at the start of the packet passed to
+    /// [`Peer::decrypt`]. It is zero for a keepalive.
+    pub payload_len: usize,
 
     /// True when this packet confirmed a responder session, making it the
     /// send session: staged payloads can be flushed.
@@ -389,7 +389,7 @@ impl Peer {
         if session.expired(now) {
             return Err(PeerError::Expired);
         }
-        let payload = session.receive(packet).map_err(|error| match error {
+        let payload_len = session.receive(packet).map_err(|error| match error {
             SessionReceiveError::Invalid => PeerError::Invalid,
             SessionReceiveError::Replay => PeerError::Replay,
         })?;
@@ -400,7 +400,7 @@ impl Peer {
             unmapped = self.adopt_current(session, source);
         }
         Ok(Recv {
-            payload,
+            payload_len,
             confirmed: unconfirmed,
             unmapped,
         })
@@ -475,7 +475,7 @@ mod tests {
         let recv = b
             .decrypt(now, receiver, &mut keepalive[..len], addr(1))
             .expect("valid keepalive");
-        assert!(recv.payload.is_empty());
+        assert_eq!(recv.payload_len, 0);
         assert!(recv.confirmed);
         assert_eq!(recv.unmapped, None);
 
@@ -494,7 +494,7 @@ mod tests {
         let recv = b
             .decrypt(now, receiver, &mut buf[..len], addr(9))
             .expect("valid data");
-        assert_eq!(&buf[recv.payload.clone()], payload);
+        assert_eq!(&buf[..recv.payload_len], payload);
         assert!(!recv.confirmed);
         // roaming: the authenticated packet's source becomes the endpoint
         assert_eq!(b.endpoint(), Some(addr(9)));
@@ -506,7 +506,7 @@ mod tests {
         let recv = a
             .decrypt(now, receiver, &mut buf[..len], addr(2))
             .expect("valid data");
-        assert_eq!(&buf[recv.payload], payload);
+        assert_eq!(&buf[..recv.payload_len], payload);
     }
 
     #[test]

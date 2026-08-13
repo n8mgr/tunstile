@@ -67,7 +67,7 @@ async fn main() {
                 let mut ip_pkt = Vec::new();
                 builder.write(&mut ip_pkt, payload.as_bytes()).unwrap();
                 peer.send(ip_pkt).await.unwrap();
-                let status = peer.status();
+                let status = peer.status().unwrap();
                 println!(
                     "[{:>3}s] sent {payload:?} (tx {} rx {})",
                     started.elapsed().as_secs(),
@@ -86,7 +86,7 @@ async fn main() {
         }
     }
 
-    let status = peer.status();
+    let status = peer.status().unwrap();
     println!(
         "done: tx {} rx {} last_handshake {:?}",
         status.tx_bytes, status.rx_bytes, status.last_successful_handshake

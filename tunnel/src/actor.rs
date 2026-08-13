@@ -29,7 +29,9 @@ use tunstile_protocol::{
     transport::Transport,
 };
 
-use crate::{Packet, PeerConfig, PeerStatus, router::Control, socket::UdpSocket};
+use crate::{
+    Packet, PeerConfig, PeerStatus, PeerUpdate, Update, router::Control, socket::UdpSocket,
+};
 
 const MAX_STAGED_PACKETS: usize = 128;
 
@@ -49,9 +51,8 @@ impl Clock {
         self.epoch.elapsed().into()
     }
 
-    /// A sleep for a select arm gated on `at.is_some()`; a disabled arm
-    /// still evaluates its expression, so `None` yields an arbitrary
-    /// instant that is never polled.
+    /// `None` yields a sleep the gated select arm never polls; the arm's
+    /// expression is still evaluated when its guard is false.
     fn sleep_until(&self, at: Option<Timestamp>) -> Sleep {
         sleep_until(self.epoch + Duration::from(at.unwrap_or_default()))
     }
@@ -63,8 +64,6 @@ fn rekey_jitter() -> Duration {
     ))
 }
 
-/// An in-flight handshake: retransmitted every Rekey-Timeout until attempts
-/// span Rekey-Attempt-Time.
 #[derive(Clone, Copy)]
 struct HandshakeAttempt {
     first_sent: Timestamp,
@@ -80,8 +79,6 @@ impl HandshakeAttempt {
     }
 }
 
-/// The current transport session's deadlines; the run loop's select arms
-/// act on them directly.
 struct Session {
     initiator: bool,
     established: Timestamp,
@@ -135,7 +132,7 @@ impl Session {
 
 pub(crate) enum PeerAction {
     Connect(SocketAddr),
-    SetConfig(PeerConfig),
+    Update(PeerUpdate),
     SendData(Vec<u8>),
     RecvData(Vec<u8>, u32, SocketAddr),
     RecvHandshakeInit(Handshake<InitReceived>, SocketAddr),
@@ -149,13 +146,10 @@ struct PeerActor {
     machine: PeerState,
     clock: Clock,
 
-    // index-routing updates for the read loop
     control: mpsc::UnboundedSender<Control>,
 
     persistent_keepalive: Option<Duration>,
-    // the last outbound wire packet, advanced on every persistent-keepalive
-    // attempt even when nothing could be sent so the timer never spins; it
-    // outlives sessions and handshakes so a dead tunnel keeps re-initiating
+    // also advanced on failed keepalive attempts so the timer never spins
     last_send: Timestamp,
     handshake: Option<HandshakeAttempt>,
     session: Option<Session>,
@@ -237,10 +231,18 @@ impl PeerActor {
         }
     }
 
-    async fn set_config(&mut self, config: PeerConfig) {
-        self.machine.set_preshared_key(config.preshared_key);
-        self.persistent_keepalive = config.persistent_keepalive;
-        if let Some(endpoint) = config.endpoint {
+    async fn apply_update(&mut self, update: PeerUpdate) {
+        match update.preshared_key {
+            Update::Keep => {}
+            Update::Clear => self.machine.set_preshared_key(None),
+            Update::Set(preshared_key) => self.machine.set_preshared_key(Some(preshared_key)),
+        }
+        match update.persistent_keepalive {
+            Update::Keep => {}
+            Update::Clear => self.persistent_keepalive = None,
+            Update::Set(interval) => self.persistent_keepalive = Some(interval),
+        }
+        if let Some(endpoint) = update.endpoint {
             self.machine.set_endpoint(endpoint);
             self.update_status(|status| status.endpoint = Some(endpoint));
             self.ensure_handshake().await;
@@ -266,7 +268,7 @@ impl PeerActor {
                 self.update_status(|status| status.endpoint = Some(endpoint));
                 self.ensure_handshake().await;
             }
-            PeerAction::SetConfig(config) => self.set_config(config).await,
+            PeerAction::Update(update) => self.apply_update(update).await,
             PeerAction::SendData(payload) => {
                 let mut payloads = vec![payload];
                 self.flush_sends(&mut payloads).await;
@@ -276,14 +278,11 @@ impl PeerActor {
                 match self.machine.decrypt(now, receiver, &mut data, endpoint) {
                     Ok(recv) => {
                         let confirmed = recv.confirmed;
-                        let unmapped = recv.unmapped;
-                        let payload_range = recv.payload;
-                        let payload = (!payload_range.is_empty()).then(|| {
-                            debug_assert_eq!(payload_range.start, 0);
-                            data.truncate(payload_range.end);
+                        let payload = (recv.payload_len > 0).then(|| {
+                            data.truncate(recv.payload_len);
                             data
                         });
-                        self.retire_index(unmapped);
+                        self.retire_index(recv.unmapped);
                         self.update_status(|status| {
                             status.endpoint = Some(endpoint);
                             status.rx_bytes += rx_bytes;
@@ -543,17 +542,12 @@ impl PeerActor {
         }
     }
 
-    /// The next persistent-keepalive deadline. It survives session expiry
-    /// and handshake abandonment so an unreachable peer keeps being retried,
-    /// but requires a known endpoint to send to.
     fn persistent_keepalive_at(&self) -> Option<Timestamp> {
         self.persistent_keepalive
             .filter(|_| self.machine.endpoint().is_some())
             .map(|interval| self.last_send + interval)
     }
 
-    /// The in-flight handshake hit its retransmit deadline: retry, or give
-    /// up once attempts span Rekey-Attempt-Time.
     async fn handshake_due(&mut self) {
         let Some(handshake) = self.handshake else {
             return;
@@ -579,8 +573,6 @@ impl PeerActor {
         self.session = None;
     }
 
-    /// Data sent Keepalive-Timeout + Rekey-Timeout ago went unanswered:
-    /// assume the session died and negotiate a new one.
     async fn new_handshake_due(&mut self) {
         if let Some(session) = self.session.as_mut() {
             session.new_handshake_at = None;
@@ -588,18 +580,14 @@ impl PeerActor {
         self.ensure_handshake().await;
     }
 
-    /// The persistent-keepalive interval elapsed without an outbound packet.
-    /// Without a usable session the handshake takes the keepalive's place —
-    /// completing it confirms with a keepalive — so an unreachable peer
-    /// keeps being retried.
     async fn persistent_keepalive_due(&mut self) {
         let now = self.clock.now();
-        // advance the timer before attempting anything so a failed send
-        // waits out the interval instead of spinning
         self.last_send = now;
         if self.session.as_ref().is_some_and(|s| s.usable(now)) {
             self.send_keepalive().await;
         } else {
+            // the handshake stands in for the keepalive: completing it
+            // confirms the session with one
             self.ensure_handshake().await;
         }
     }
@@ -693,7 +681,6 @@ pub(crate) fn spawn(
             clock: Clock::new(),
             control,
             persistent_keepalive: config.persistent_keepalive,
-            // a fresh clock starts at zero, so the timer arms from creation
             last_send: Timestamp::default(),
             handshake: None,
             session: None,
@@ -753,7 +740,6 @@ mod tests {
         let interval = Duration::from_secs(25);
         let mut actor = test_actor(Some(interval)).await;
 
-        // without an endpoint there is nothing to keep alive
         assert_eq!(actor.persistent_keepalive_at(), None);
 
         let endpoint = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -764,16 +750,12 @@ mod tests {
             "armed with no session and no handshake"
         );
 
-        // firing with no session initiates a handshake and leaves the next
-        // deadline in the clock's future so a failed attempt cannot spin
         actor.persistent_keepalive_due().await;
         assert!(actor.handshake.is_some());
         assert!(actor.status.read().unwrap().tx_bytes > 0);
         assert!(actor.persistent_keepalive_at().unwrap() > actor.clock.now());
     }
 
-    // retransmits anchor to the first attempt; the whole attempt is
-    // abandoned once it spans Rekey-Attempt-Time
     #[tokio::test(start_paused = true)]
     async fn handshake_abandoned_after_attempt_time() {
         let mut actor = test_actor(None).await;
@@ -785,7 +767,6 @@ mod tests {
         assert!(first.retry_at >= Timestamp::default() + REKEY_TIMEOUT);
         assert!(first.retry_at < Timestamp::default() + REKEY_TIMEOUT + REKEY_TIMEOUT_JITTER_MAX);
 
-        // within the window: due fires a fresh initiation, same anchor
         actor.handshake_due().await;
         assert_eq!(
             actor.handshake.expect("retransmitted").first_sent,

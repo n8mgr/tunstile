@@ -7,8 +7,8 @@ use crate::{
     time::Instant,
 };
 
-/// Above this inbound-handshake rate, [`LoadGuard`] demands a cookie before
-/// CPU is spent on a handshake.
+/// The default inbound-handshake rate above which [`LoadGuard`] demands a
+/// cookie before CPU is spent on a handshake.
 pub const MAX_HANDSHAKES_PER_SECOND: u32 = 25;
 
 /// Result of checking an inbound handshake message.
@@ -22,12 +22,13 @@ pub enum HandshakeDecision {
 }
 
 /// Validates handshake MACs and requires a cookie when the inbound handshake
-/// rate exceeds [`MAX_HANDSHAKES_PER_SECOND`].
+/// rate exceeds a threshold ([`MAX_HANDSHAKES_PER_SECOND`] by default).
 pub struct LoadGuard {
     verifier: Verifier,
     secret: [u8; 32],
     window_start: Instant,
     handshakes: u32,
+    max_per_second: u32,
 }
 
 impl LoadGuard {
@@ -39,7 +40,15 @@ impl LoadGuard {
             secret,
             window_start: Instant::default(),
             handshakes: 0,
+            max_per_second: MAX_HANDSHAKES_PER_SECOND,
         }
+    }
+
+    /// Replaces the rate above which cookies are demanded; zero demands a
+    /// cookie for every handshake.
+    pub fn with_max_rate(mut self, max_handshakes_per_second: u32) -> Self {
+        self.max_per_second = max_handshakes_per_second;
+        self
     }
 
     /// Replaces the rotating cookie secret.
@@ -48,15 +57,13 @@ impl LoadGuard {
     }
 
     /// Checks an inbound handshake message. `nonce` is used only if a cookie
-    /// reply is issued. `force_under_load` skips the rate threshold and
-    /// always demands a cookie.
+    /// reply is issued.
     pub fn check(
         &mut self,
         now: Instant,
         msg: &[u8],
         source: SocketAddr,
         nonce: [u8; 24],
-        force_under_load: bool,
     ) -> HandshakeDecision {
         if !matches!(
             MessageHeader::try_from(msg),
@@ -71,8 +78,7 @@ impl LoadGuard {
         }
         self.handshakes += 1;
 
-        let under_load = force_under_load || self.handshakes > MAX_HANDSHAKES_PER_SECOND;
-        if !under_load {
+        if self.handshakes <= self.max_per_second {
             return HandshakeDecision::Process;
         }
         let (source, len) = source_bytes(source);
@@ -140,12 +146,12 @@ mod tests {
         let a_key = PrivateKey::random();
         let b_key = PrivateKey::random();
         let mut a = Peer::new(b_key.public_key());
-        let mut guard = LoadGuard::new(&b_key.public_key(), [42u8; 32]);
+        let mut guard = LoadGuard::new(&b_key.public_key(), [42u8; 32]).with_max_rate(0);
         a.set_endpoint(addr(2));
 
         let mut init = [0u8; handshake::INIT_MSG_LENGTH];
         a.initiate(&a_key, values(1), &mut init).unwrap();
-        let reply = match guard.check(now, &init, addr(1), [7u8; 24], true) {
+        let reply = match guard.check(now, &init, addr(1), [7u8; 24]) {
             HandshakeDecision::Cookie(reply) => reply,
             _ => panic!("expected a cookie challenge"),
         };
@@ -154,7 +160,7 @@ mod tests {
             .expect("valid cookie reply");
         a.initiate(&a_key, values(2), &mut init).unwrap();
         assert!(matches!(
-            guard.check(now, &init, addr(1), [8u8; 24], true),
+            guard.check(now, &init, addr(1), [8u8; 24]),
             HandshakeDecision::Process
         ));
     }
@@ -166,7 +172,7 @@ mod tests {
         let b_key = PrivateKey::random();
         let mut a = Peer::new(b_key.public_key());
         let mut b = Peer::new(a_key.public_key());
-        let mut guard = LoadGuard::new(&a_key.public_key(), [42u8; 32]);
+        let mut guard = LoadGuard::new(&a_key.public_key(), [42u8; 32]).with_max_rate(0);
         a.set_endpoint(addr(2));
 
         let mut init = [0u8; handshake::INIT_MSG_LENGTH];
@@ -176,7 +182,7 @@ mod tests {
         b.respond(now, received, values(2), addr(1), &mut response)
             .unwrap();
 
-        let reply = match guard.check(now, &response, addr(2), [7u8; 24], true) {
+        let reply = match guard.check(now, &response, addr(2), [7u8; 24]) {
             HandshakeDecision::Cookie(reply) => reply,
             _ => panic!("expected a cookie challenge"),
         };
@@ -208,7 +214,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            guard.check(now, &response, addr(2), [8u8; 24], true),
+            guard.check(now, &response, addr(2), [8u8; 24]),
             HandshakeDecision::Process
         ));
     }

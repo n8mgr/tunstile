@@ -162,10 +162,10 @@ impl Transport {
     }
 
     /// Decrypts a received encrypted transport data message in place,
-    /// returning its counter and the plaintext range at the beginning of
-    /// `packet`. The counter must be checked against a [`ReplayFilter`] before
-    /// the payload is trusted.
-    pub fn receive(&self, packet: &mut [u8]) -> Result<(u64, Range<usize>), TransportError> {
+    /// returning its counter and the length of the plaintext now at the
+    /// beginning of `packet`. The counter must be checked against a
+    /// [`ReplayFilter`] before the payload is trusted.
+    pub fn receive(&self, packet: &mut [u8]) -> Result<(u64, usize), TransportError> {
         if packet.len() < Self::packet_len(0)
             || MessageType::try_from(packet[0]) != Ok(MessageType::Data)
             || packet[1..4] != [0; 3]
@@ -180,10 +180,7 @@ impl Transport {
         if !aead_open_within(&self.recv_aead, counter, &[], packet, DATA_PAYLOAD_OFFSET..) {
             return Err(TransportError::InvalidPacket);
         }
-        Ok((
-            counter,
-            0..packet.len() - DATA_PAYLOAD_OFFSET - AEAD_TAG_SIZE,
-        ))
+        Ok((counter, packet.len() - DATA_PAYLOAD_OFFSET - AEAD_TAG_SIZE))
     }
 }
 

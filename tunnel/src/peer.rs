@@ -2,7 +2,7 @@
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, RwLock, Weak},
+    sync::{Arc, Weak},
 };
 
 use tokio::sync::{mpsc::error::TrySendError, watch};
@@ -21,7 +21,6 @@ use crate::{
 #[must_use = "dropping the Peer unregisters it from the tunnel"]
 pub struct Peer {
     sender: PeerSender,
-    status: Arc<RwLock<PeerStatus>>,
     session_rx: watch::Receiver<bool>,
 }
 
@@ -38,7 +37,6 @@ impl Peer {
         public_key: PublicKey,
         router: Weak<RoutingTable>,
         entry: Weak<PeerEntry>,
-        status: Arc<RwLock<PeerStatus>>,
         session_rx: watch::Receiver<bool>,
     ) -> Self {
         Self {
@@ -47,7 +45,6 @@ impl Peer {
                 router,
                 entry,
             },
-            status,
             session_rx,
         }
     }
@@ -57,9 +54,9 @@ impl Peer {
         self.sender.public_key()
     }
 
-    /// Current status snapshot for this peer.
-    pub fn status(&self) -> PeerStatus {
-        self.status.read().unwrap().clone()
+    /// Current status snapshot, or `None` once the tunnel is dropped.
+    pub fn status(&self) -> Option<PeerStatus> {
+        self.sender.status()
     }
 
     /// Sends a payload to this peer, waiting for queue capacity. Pre-session

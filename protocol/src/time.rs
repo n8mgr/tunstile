@@ -5,9 +5,7 @@ use core::ops::Add;
 pub use core::time::Duration;
 
 /// A point on the driver's monotonic clock: the time elapsed since an
-/// arbitrary epoch of the driver's choosing. The newtype keeps points and
-/// spans apart — comparing or exchanging an `Instant` with a bare
-/// [`Duration`] is a type error unless converted explicitly.
+/// arbitrary epoch of the driver's choosing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Instant(Duration);
 

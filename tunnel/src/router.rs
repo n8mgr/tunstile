@@ -32,9 +32,6 @@ pub(crate) struct PeerEntry {
 }
 
 /// The peer registry, shared between the tunnel handle and the read loop.
-/// Peer handles hold weak entries, so per-packet sends never touch the
-/// registry lock; it is taken only to register, remove, or enumerate peers
-/// and to route handshake initiations.
 pub(crate) struct RoutingTable {
     peers: RwLock<HashMap<PublicKey, Arc<PeerEntry>>>,
     control: mpsc::UnboundedSender<Control>,
@@ -99,15 +96,15 @@ impl RoutingTable {
             .collect()
     }
 
-    pub(crate) async fn set_config(
+    pub(crate) async fn set_peer(
         &self,
         public_key: &PublicKey,
-        config: crate::PeerConfig,
+        update: crate::PeerUpdate,
     ) -> Result<(), SendError> {
         let entry = self.entry(public_key).ok_or(SendError::PeerRemoved)?;
         entry
             .actions
-            .send(PeerAction::SetConfig(config))
+            .send(PeerAction::Update(update))
             .await
             .map_err(|_| SendError::PeerRemoved)
     }
@@ -126,7 +123,7 @@ impl RoutingTable {
 }
 
 /// Receiver-index routing, owned exclusively by the read loop and updated
-/// through [`Control`] messages so no lock sits on the inbound packet path.
+/// through [`Control`] messages.
 pub(crate) struct IndexRouter {
     indices: HashMap<u32, mpsc::Sender<PeerAction>>,
 }

@@ -1,4 +1,4 @@
-use core::{ops::Range, time::Duration};
+use core::time::Duration;
 
 use crate::{
     time::Instant,
@@ -58,18 +58,15 @@ impl Session {
         self.transport.send(payload, out)
     }
 
-    pub(super) fn receive(
-        &mut self,
-        packet: &mut [u8],
-    ) -> Result<Range<usize>, SessionReceiveError> {
-        let (counter, payload) = self
+    pub(super) fn receive(&mut self, packet: &mut [u8]) -> Result<usize, SessionReceiveError> {
+        let (counter, payload_len) = self
             .transport
             .receive(packet)
             .map_err(|_| SessionReceiveError::Invalid)?;
         if !self.replay.validate(counter) {
             return Err(SessionReceiveError::Replay);
         }
-        Ok(payload)
+        Ok(payload_len)
     }
 }
 

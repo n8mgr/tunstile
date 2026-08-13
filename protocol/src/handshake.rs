@@ -478,7 +478,7 @@ mod tests {
 
         let (counter, init_payload) = t_resp.receive(&mut init_msg).expect("valid init data");
         assert_eq!(counter, 0);
-        assert_eq!(&init_msg[init_payload], INITIATOR_DATA);
+        assert_eq!(&init_msg[..init_payload], INITIATOR_DATA);
 
         const RECEIVER_DATA: &[u8] = b"Goodbye, World!";
         let mut recv_msg = vec![0u8; Transport::packet_len(RECEIVER_DATA.len())];
@@ -489,7 +489,7 @@ mod tests {
 
         let (counter, recv_payload) = t_init.receive(&mut recv_msg).expect("valid recv data");
         assert_eq!(counter, 0);
-        assert_eq!(&recv_msg[recv_payload], RECEIVER_DATA);
+        assert_eq!(&recv_msg[..recv_payload], RECEIVER_DATA);
     }
 
     #[test]

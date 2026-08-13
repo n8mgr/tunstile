@@ -30,10 +30,7 @@
 use std::{
     io::{self, IoSliceMut},
     net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -91,11 +88,10 @@ pub enum RegisterError {
     AlreadyRegistered,
 }
 
-/// Optional settings for a peer.
+/// Optional settings for a peer at registration.
 #[derive(Debug, Clone, Default)]
 pub struct PeerConfig {
-    /// The peer's initial or replacement endpoint. When passed to
-    /// [`Tunnel::set_peer`], `None` keeps the current endpoint.
+    /// The peer's initial endpoint.
     pub endpoint: Option<SocketAddr>,
 
     /// The optional pre-shared key.
@@ -103,6 +99,29 @@ pub struct PeerConfig {
 
     /// The persistent keepalive interval.
     pub persistent_keepalive: Option<Duration>,
+}
+
+/// An explicit change to one optional peer setting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Update<T> {
+    /// Leave the current value alone.
+    #[default]
+    Keep,
+    /// Remove or disable it.
+    Clear,
+    /// Replace it.
+    Set(T),
+}
+
+/// Explicit changes for [`Tunnel::set_peer`]; the default changes nothing.
+#[derive(Debug, Clone, Default)]
+pub struct PeerUpdate {
+    /// A replacement endpoint; `None` keeps the current one.
+    pub endpoint: Option<SocketAddr>,
+
+    pub preshared_key: Update<PresharedKey>,
+
+    pub persistent_keepalive: Update<Duration>,
 }
 
 /// A decrypted payload from [`Tunnel::recv`] and the peer that sent it.
@@ -158,14 +177,9 @@ pub struct Tunnel {
     socket: Arc<UdpSocket>,
     router: Arc<RoutingTable>,
     control: mpsc::UnboundedSender<Control>,
-    // the tunnel keeps a sender so peers registered later can be handed a
-    // clone; the queue never closes while the tunnel is alive
+    // holding a sender keeps the queue open for later-registered peers
     inbound_tx: mpsc::Sender<Packet>,
     inbound_rx: mpsc::Receiver<Packet>,
-    // only the read loop's clone is read in production; the tunnel keeps a
-    // handle solely so tests can force the under-load path
-    #[cfg(test)]
-    under_load: Arc<AtomicBool>,
     read_task: JoinHandle<()>,
 }
 
@@ -181,10 +195,9 @@ impl Tunnel {
         socket: Arc<UdpSocket>,
         router: Arc<RoutingTable>,
         mut control: mpsc::UnboundedReceiver<Control>,
-        under_load: Arc<AtomicBool>,
+        mut guard: LoadGuard,
     ) {
         let clock = Clock::new();
-        let mut guard = LoadGuard::new(&our_private.public_key(), rand::random());
         let mut secret_rotated = clock.now();
         let mut bufs = vec![vec![0u8; MAX_MESSAGE_SIZE]; BATCH_SIZE];
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
@@ -237,8 +250,7 @@ impl Tunnel {
                             guard.rotate_secret(rand::random());
                             secret_rotated = now;
                         }
-                        let force = under_load.load(Ordering::Relaxed);
-                        match guard.check(now, segment, meta.addr, rand::random(), force) {
+                        match guard.check(now, segment, meta.addr, rand::random()) {
                             HandshakeDecision::Process => {}
                             HandshakeDecision::Drop => {
                                 debug!("dropping handshake from {} (mac1)", meta.addr);
@@ -279,10 +291,12 @@ impl Tunnel {
         }
     }
 
-    fn register_peer(
+    /// Registers a peer and returns its handle, initiating a handshake if the
+    /// config carries an endpoint. Errors if the peer is already registered.
+    pub async fn add_peer(
         &self,
         public_key: &PublicKey,
-        config: &PeerConfig,
+        config: PeerConfig,
     ) -> Result<Peer, RegisterError> {
         let (actions, entry) = self
             .router
@@ -291,52 +305,40 @@ impl Tunnel {
         let session_rx = actor::spawn(
             self.our_key.clone(),
             public_key.clone(),
-            config,
+            &config,
             self.control.clone(),
             self.socket.clone(),
             entry.status.clone(),
             actions,
             self.inbound_tx.clone(),
         );
-        Ok(Peer::new(
+        let peer = Peer::new(
             public_key.clone(),
             Arc::downgrade(&self.router),
             Arc::downgrade(&entry),
-            entry.status.clone(),
             session_rx,
-        ))
-    }
-
-    /// Registers a peer and returns its handle, initiating a handshake if the
-    /// config carries an endpoint. Errors if the peer is already registered.
-    pub async fn add_peer(
-        &self,
-        public_key: &PublicKey,
-        config: PeerConfig,
-    ) -> Result<Peer, RegisterError> {
-        let peer = self.register_peer(public_key, &config)?;
+        );
         if let Some(endpoint) = config.endpoint {
             let _ = peer.connect(endpoint).await;
         }
         Ok(peer)
     }
 
-    /// Replaces a registered peer's pre-shared key and persistent keepalive
-    /// without unregistering it or discarding protocol state. A configured
-    /// endpoint also replaces the current endpoint; `None` leaves it alone.
-    /// `None` clears the pre-shared key or disables persistent keepalive.
+    /// Applies explicit updates to a registered peer without unregistering
+    /// it or discarding protocol state. Errors with
+    /// [`SendError::PeerRemoved`] when the peer isn't registered; no other
+    /// error occurs.
     pub async fn set_peer(
         &self,
         public_key: &PublicKey,
-        config: PeerConfig,
+        update: PeerUpdate,
     ) -> Result<(), SendError> {
-        self.router.set_config(public_key, config).await
+        self.router.set_peer(public_key, update).await
     }
 
     /// Receives the next decrypted payload from any registered peer, waiting
     /// until one arrives. Payloads are dropped rather than queued when the
-    /// inbound queue is full — a slow reader must not stall the peers' timers
-    /// and handshakes.
+    /// inbound queue is full.
     pub async fn recv(&mut self) -> Packet {
         self.inbound_rx
             .recv()
@@ -395,10 +397,14 @@ impl Tunnel {
     }
 
     fn start(socket: UdpSocket, our_key: PrivateKey) -> Self {
+        let guard = LoadGuard::new(&our_key.public_key(), rand::random());
+        Self::start_with_guard(socket, our_key, guard)
+    }
+
+    fn start_with_guard(socket: UdpSocket, our_key: PrivateKey, guard: LoadGuard) -> Self {
         let socket = Arc::new(socket);
         let (control, control_rx) = mpsc::unbounded_channel();
         let router = Arc::new(RoutingTable::new(control.clone()));
-        let under_load = Arc::new(AtomicBool::new(false));
         let our_key = Arc::new(our_key);
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
         let read_task = spawn(Self::read_loop(
@@ -406,7 +412,7 @@ impl Tunnel {
             socket.clone(),
             router.clone(),
             control_rx,
-            under_load.clone(),
+            guard,
         ));
         Self {
             our_key,
@@ -415,15 +421,16 @@ impl Tunnel {
             control,
             inbound_tx,
             inbound_rx,
-            #[cfg(test)]
-            under_load,
             read_task,
         }
     }
 
+    /// A tunnel whose load guard demands a cookie for every handshake.
     #[cfg(test)]
-    fn force_under_load(&self) {
-        self.under_load.store(true, Ordering::Relaxed);
+    async fn new_under_load(addr: SocketAddr, our_key: PrivateKey) -> io::Result<Self> {
+        let socket = UdpSocket::bind(addr).await?;
+        let guard = LoadGuard::new(&our_key.public_key(), rand::random()).with_max_rate(0);
+        Ok(Self::start_with_guard(socket, our_key, guard))
     }
 }
 
@@ -465,9 +472,8 @@ mod tests {
         let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
-        let mut tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
+        let mut tunnel_b = Tunnel::new_under_load(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
-        tunnel_b.force_under_load();
 
         let _peer_a = tunnel_b
             .add_peer(&pk_a, PeerConfig::default())
@@ -530,13 +536,13 @@ mod tests {
 
         // the initiator confirms the session with a keepalive
         let keepalive_len = Transport::packet_len(0) as u64;
-        let stat = peer_b.status();
+        let stat = peer_b.status().unwrap();
         assert_eq!(stat.tx_bytes, INIT_MSG_LENGTH as u64 + keepalive_len);
         assert_eq!(stat.rx_bytes, RESP_MSG_LENGTH as u64);
         let a_rx = stat.rx_bytes;
         let a_tx = stat.tx_bytes;
 
-        let stat = peer_a.status();
+        let stat = peer_a.status().unwrap();
         assert_eq!(stat.tx_bytes, RESP_MSG_LENGTH as u64);
         assert_eq!(stat.rx_bytes, INIT_MSG_LENGTH as u64 + keepalive_len);
         let b_rx = stat.rx_bytes;
@@ -630,7 +636,7 @@ mod tests {
             .unwrap();
         let payload = b"staged before endpoint".to_vec();
         peer_a.send(payload.clone()).await.unwrap();
-        assert!(peer_a.status().last_send.is_none());
+        assert!(peer_a.status().unwrap().last_send.is_none());
 
         let _peer_b = tunnel_a
             .add_peer(
@@ -735,13 +741,13 @@ mod tests {
             .await
             .expect("handshake did not complete")
             .unwrap();
-        let rx_before_update = peer_b.status().rx_bytes;
+        let rx_before_update = peer_b.status().unwrap().rx_bytes;
 
         tunnel_b
             .set_peer(
                 &pk_a,
-                PeerConfig {
-                    preshared_key: Some(psk.clone()),
+                PeerUpdate {
+                    preshared_key: Update::Set(psk.clone()),
                     ..Default::default()
                 },
             )
@@ -750,8 +756,8 @@ mod tests {
         tunnel_a
             .set_peer(
                 &pk_b,
-                PeerConfig {
-                    preshared_key: Some(psk),
+                PeerUpdate {
+                    preshared_key: Update::Set(psk),
                     ..Default::default()
                 },
             )
@@ -770,7 +776,7 @@ mod tests {
         peer_b.connect(addr_b).await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(5), async {
-            while peer_b.status().rx_bytes < rx_before_update + RESP_MSG_LENGTH as u64 {
+            while peer_b.status().unwrap().rx_bytes < rx_before_update + RESP_MSG_LENGTH as u64 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -826,7 +832,7 @@ mod tests {
                 .is_err()
         );
         // one init sent; the invalid response was dropped without re-initiating
-        assert_eq!(peer_b.status().tx_bytes, INIT_MSG_LENGTH as u64);
+        assert_eq!(peer_b.status().unwrap().tx_bytes, INIT_MSG_LENGTH as u64);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -859,23 +865,23 @@ mod tests {
         tunnel_a
             .set_peer(
                 &pk_b,
-                PeerConfig {
-                    persistent_keepalive: Some(Duration::from_millis(100)),
+                PeerUpdate {
+                    persistent_keepalive: Update::Set(Duration::from_millis(100)),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        let sent = peer_b.status().tx_bytes;
+        let sent = peer_b.status().unwrap().tx_bytes;
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         let keepalive_len = Transport::packet_len(0) as u64;
-        let sent = peer_b.status().tx_bytes - sent;
+        let sent = peer_b.status().unwrap().tx_bytes - sent;
         assert!(
             sent >= 2 * keepalive_len,
             "expected at least 2 keepalives, sent {sent} bytes"
         );
-        assert!(peer_a.status().rx_bytes >= INIT_MSG_LENGTH as u64 + 2 * keepalive_len);
+        assert!(peer_a.status().unwrap().rx_bytes >= INIT_MSG_LENGTH as u64 + 2 * keepalive_len);
     }
 }

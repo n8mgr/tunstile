@@ -50,10 +50,10 @@ use tunstile_tunnel::{
 
 mod allowed_ips;
 mod config;
-pub use config::{DeviceConfig, PeerConfig};
+pub use config::{DeviceConfig, PeerConfig, PeerUpdate};
 pub use ipnet::IpNet;
 pub use tunstile_tunnel::{
-    KeyParseError, PeerStatus, PresharedKey, PrivateKey, PublicKey, SendError,
+    KeyParseError, PeerStatus, PresharedKey, PrivateKey, PublicKey, SendError, Update,
 };
 
 /// Error creating or operating a device.
@@ -244,15 +244,12 @@ impl Device {
         Ok(())
     }
 
-    /// Replaces a registered peer's AllowedIPs, pre-shared key, and persistent
-    /// keepalive without unregistering it or discarding protocol state. A
-    /// configured endpoint also replaces the current endpoint; `None` leaves
-    /// it alone. `None` clears the pre-shared key or disables persistent
-    /// keepalive; an empty `allowed_ips` removes all of the peer's routes.
+    /// Applies explicit updates to a registered peer without unregistering
+    /// it or discarding protocol state.
     pub async fn set_peer(
         &mut self,
         public_key: &PublicKey,
-        config: PeerConfig,
+        update: PeerUpdate,
     ) -> Result<(), DeviceError> {
         let sender = self
             .peers
@@ -260,13 +257,21 @@ impl Device {
             .map(Peer::sender)
             .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
 
-        let (tunnel_config, peer_allowed_ips) = config.take_tunnel();
-        self.tunnel.set_peer(public_key, tunnel_config).await?;
+        let (tunnel_update, allowed_ips) = update.take_tunnel();
+        self.tunnel.set_peer(public_key, tunnel_update).await?;
 
-        self.allowed_ips
-            .retain(|owner| owner.public_key() != public_key);
-        for net in peer_allowed_ips {
-            self.allowed_ips.insert(net, sender.clone());
+        match allowed_ips {
+            Update::Keep => {}
+            Update::Clear => self
+                .allowed_ips
+                .retain(|owner| owner.public_key() != public_key),
+            Update::Set(nets) => {
+                self.allowed_ips
+                    .retain(|owner| owner.public_key() != public_key);
+                for net in nets {
+                    self.allowed_ips.insert(net, sender.clone());
+                }
+            }
         }
         Ok(())
     }
@@ -546,8 +551,8 @@ mod tests {
         device_a
             .set_peer(
                 &public_b,
-                PeerConfig {
-                    allowed_ips: vec!["10.0.0.3/32".parse().unwrap()],
+                PeerUpdate {
+                    allowed_ips: Update::Set(vec!["10.0.0.3/32".parse().unwrap()]),
                     ..Default::default()
                 },
             )
@@ -585,7 +590,7 @@ mod tests {
         ));
         assert!(matches!(
             device_a
-                .set_peer(&public_b, PeerConfig::default())
+                .set_peer(&public_b, PeerUpdate::default())
                 .await,
             Err(DeviceError::UnknownPeer(key)) if key == public_b
         ));
