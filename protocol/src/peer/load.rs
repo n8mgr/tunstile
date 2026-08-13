@@ -37,7 +37,7 @@ impl LoadGuard {
         Self {
             verifier: Verifier::new(our_public),
             secret,
-            window_start: Instant::from_millis(0),
+            window_start: Instant::default(),
             handshakes: 0,
         }
     }
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn cookie_round_trip_under_load() {
-        let now = Instant::from_millis(0);
+        let now = Instant::default();
         let a_key = PrivateKey::random();
         let b_key = PrivateKey::random();
         let mut a = Peer::new(b_key.public_key());
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn cookie_reply_to_response_applies_to_next_response() {
-        let now = Instant::from_millis(0);
+        let now = Instant::default();
         let a_key = PrivateKey::random();
         let b_key = PrivateKey::random();
         let mut a = Peer::new(b_key.public_key());

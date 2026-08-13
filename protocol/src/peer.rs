@@ -4,7 +4,8 @@
 //! crypto state, session rotation with confirm-on-first-packet semantics, replay windows,
 //! and endpoint roaming. It also enforces the safety rules — an expired
 //! session is unusable and replayed counters are rejected — via the `now`
-//! parameters.
+//! parameters: elapsed time on the driver's monotonic clock, measured from
+//! an arbitrary epoch of its choosing.
 
 use core::{net::SocketAddr, ops::Range};
 
@@ -13,11 +14,11 @@ use thiserror::Error;
 use x25519_dalek::ReusableSecret;
 
 use crate::keys::PresharedKey;
+use crate::time::Instant;
 use crate::{
     cookies::Generator,
     handshake::{self, Handshake, InitReceived, InitSent},
     keys::{PrivateKey, PublicKey},
-    time::Instant,
 };
 
 mod load;
@@ -417,6 +418,7 @@ impl Peer {
 #[cfg(test)]
 mod tests {
     use core::net::{IpAddr, Ipv4Addr};
+    use core::time::Duration;
 
     use super::*;
     use crate::transport::Transport;
@@ -426,7 +428,7 @@ mod tests {
     }
 
     fn ms(millis: u64) -> Instant {
-        Instant::from_millis(millis)
+        Duration::from_millis(millis).into()
     }
 
     fn receiver_index(packet: &[u8]) -> u32 {

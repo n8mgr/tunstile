@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn expires_at_reject_after_time() {
-        let established = Instant::from_millis(0);
+        let established = Instant::default();
         let session = session(established);
 
         assert!(!session.expired(established + (REJECT_AFTER_TIME - Duration::from_millis(1))));

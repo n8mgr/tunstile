@@ -3,7 +3,6 @@
 
 use std::{
     collections::VecDeque,
-    future::pending,
     net::SocketAddr,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime},
@@ -17,21 +16,20 @@ use tokio::{
         mpsc::{self, Receiver, Sender},
         watch,
     },
-    time::{Instant, sleep},
+    time::{Instant, Sleep, sleep_until},
 };
 use tunstile_protocol::{
     PrivateKey, PublicKey, ReusableSecret, Tai64N,
     handshake::{Handshake, INIT_MSG_LENGTH, InitReceived, RESP_MSG_LENGTH},
-    peer::{HandshakeValues, Peer as PeerState, REKEY_ATTEMPT_TIME},
+    peer::{
+        HandshakeValues, KEEPALIVE_TIMEOUT, Peer as PeerState, REJECT_AFTER_TIME, REKEY_AFTER_TIME,
+        REKEY_AFTER_TIME_RECEIVING, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT, REKEY_TIMEOUT_JITTER_MAX,
+    },
     time::Instant as Timestamp,
     transport::Transport,
 };
 
 use crate::{Packet, PeerConfig, PeerStatus, router::Control, socket::UdpSocket};
-
-mod timers;
-
-use timers::{HandshakeTimers, SessionTimers};
 
 const MAX_STAGED_PACKETS: usize = 128;
 
@@ -48,7 +46,90 @@ impl Clock {
     }
 
     pub(crate) fn now(&self) -> Timestamp {
-        Timestamp::from_millis(self.epoch.elapsed().as_millis() as u64)
+        self.epoch.elapsed().into()
+    }
+
+    /// A sleep for a select arm gated on `at.is_some()`; a disabled arm
+    /// still evaluates its expression, so `None` yields an arbitrary
+    /// instant that is never polled.
+    fn sleep_until(&self, at: Option<Timestamp>) -> Sleep {
+        sleep_until(self.epoch + Duration::from(at.unwrap_or_default()))
+    }
+}
+
+fn rekey_jitter() -> Duration {
+    Duration::from_millis(rand::random_range(
+        0..REKEY_TIMEOUT_JITTER_MAX.as_millis() as u64,
+    ))
+}
+
+/// An in-flight handshake: retransmitted every Rekey-Timeout until attempts
+/// span Rekey-Attempt-Time.
+#[derive(Clone, Copy)]
+struct HandshakeAttempt {
+    first_sent: Timestamp,
+    retry_at: Timestamp,
+}
+
+impl HandshakeAttempt {
+    fn new(first_sent: Timestamp, now: Timestamp) -> Self {
+        Self {
+            first_sent,
+            retry_at: now + REKEY_TIMEOUT + rekey_jitter(),
+        }
+    }
+}
+
+/// The current transport session's deadlines; the run loop's select arms
+/// act on them directly.
+struct Session {
+    initiator: bool,
+    established: Timestamp,
+    expires_at: Timestamp,
+    // a received payload awaits acknowledgement (passive keepalive)
+    keepalive_at: Option<Timestamp>,
+    // sent data went unanswered; assume the session died
+    new_handshake_at: Option<Timestamp>,
+}
+
+impl Session {
+    fn new(initiator: bool, now: Timestamp) -> Self {
+        Self {
+            initiator,
+            established: now,
+            expires_at: now + REJECT_AFTER_TIME,
+            keepalive_at: None,
+            new_handshake_at: None,
+        }
+    }
+
+    fn data_sent(&mut self, now: Timestamp) {
+        self.keepalive_at = None;
+        self.new_handshake_at
+            .get_or_insert(now + KEEPALIVE_TIMEOUT + REKEY_TIMEOUT + rekey_jitter());
+    }
+
+    fn keepalive_sent(&mut self) {
+        self.keepalive_at = None;
+    }
+
+    fn packet_received(&mut self, now: Timestamp, carried_payload: bool) {
+        self.new_handshake_at = None;
+        if carried_payload {
+            self.keepalive_at.get_or_insert(now + KEEPALIVE_TIMEOUT);
+        }
+    }
+
+    fn usable(&self, now: Timestamp) -> bool {
+        now < self.expires_at
+    }
+
+    fn rekey_after_send(&self, now: Timestamp) -> bool {
+        self.initiator && now.duration_since(self.established) >= REKEY_AFTER_TIME
+    }
+
+    fn rekey_after_receive(&self, now: Timestamp) -> bool {
+        self.initiator && now.duration_since(self.established) >= REKEY_AFTER_TIME_RECEIVING
     }
 }
 
@@ -72,8 +153,12 @@ struct PeerActor {
     control: mpsc::UnboundedSender<Control>,
 
     persistent_keepalive: Option<Duration>,
-    handshake: Option<HandshakeTimers>,
-    session: Option<SessionTimers>,
+    // the last outbound wire packet, advanced on every persistent-keepalive
+    // attempt even when nothing could be sent so the timer never spins; it
+    // outlives sessions and handshakes so a dead tunnel keeps re-initiating
+    last_send: Timestamp,
+    handshake: Option<HandshakeAttempt>,
+    session: Option<Session>,
 
     session_tx: watch::Sender<bool>,
     staged: VecDeque<Vec<u8>>,
@@ -113,7 +198,7 @@ impl PeerActor {
             return;
         };
         let now = self.clock.now();
-        self.handshake = Some(HandshakeTimers::new(first_sent, now));
+        self.handshake = Some(HandshakeAttempt::new(first_sent, now));
         let index = rand::random();
         let mut msg = [0u8; INIT_MSG_LENGTH];
         let values = HandshakeValues {
@@ -138,6 +223,7 @@ impl PeerActor {
             return;
         }
         debug!("[{}] sent handshake initiation to {}", self.label, endpoint);
+        self.last_send = now;
         self.update_status(|status| {
             status.tx_bytes += msg.len() as u64;
             status.last_send = Some(SystemTime::now());
@@ -205,7 +291,7 @@ impl PeerActor {
                         });
                         if confirmed {
                             debug!("[{}] session confirmed", self.label);
-                            self.session = Some(SessionTimers::new(false, now));
+                            self.session = Some(Session::new(false, now));
                         }
                         if let Some(session) = self.session.as_mut() {
                             session.packet_received(now, payload.is_some());
@@ -267,6 +353,7 @@ impl PeerActor {
                     );
                     return;
                 }
+                self.last_send = now;
                 self.update_status(|status| {
                     status.endpoint = Some(endpoint);
                     status.rx_bytes += INIT_MSG_LENGTH as u64;
@@ -289,7 +376,7 @@ impl PeerActor {
                     Ok(retired) => {
                         self.retire_index(retired);
                         self.handshake = None;
-                        self.session = Some(SessionTimers::new(true, now));
+                        self.session = Some(Session::new(true, now));
                         self.update_status(|status| {
                             status.endpoint = Some(endpoint);
                             status.rx_bytes += rx_bytes;
@@ -338,13 +425,14 @@ impl PeerActor {
             return;
         }
         let now = self.clock.now();
-        let max_segments = self.socket.max_gso_segments();
+        let gso_segments = self.socket.max_gso_segments();
         let mut start = 0;
         let mut stalled = false;
         let mut sent = false;
         let mut encrypted_any = false;
         while start < payloads.len() {
             let segment_size = Transport::packet_len(payloads[start].len());
+            let max_segments = max_batch_segments(gso_segments, segment_size);
             let mut end = start + 1;
             while end < payloads.len()
                 && end - start < max_segments
@@ -402,9 +490,12 @@ impl PeerActor {
         }
         payloads.clear();
         let mut rekey = encrypted_any && self.machine.rekey_due_to_messages();
-        if sent && let Some(session) = self.session.as_mut() {
-            session.data_sent(now);
-            rekey |= session.rekey_after_send(now);
+        if sent {
+            self.last_send = now;
+            if let Some(session) = self.session.as_mut() {
+                session.data_sent(now);
+                rekey |= session.rekey_after_send(now);
+            }
         }
         if rekey && self.handshake.is_none() {
             self.send_handshake(now).await;
@@ -425,11 +516,12 @@ impl PeerActor {
             .endpoint()
             .expect("usable session has endpoint");
         if let Some(session) = self.session.as_mut() {
-            session.keepalive_sent(now);
+            session.keepalive_sent();
         }
         let sent = match self.socket.send(endpoint, &msg[..len]).await {
             Ok(()) => {
                 debug!("[{}] sent keepalive", self.label);
+                self.last_send = now;
                 self.update_status(|status| {
                     status.tx_bytes += len as u64;
                     status.last_send = Some(SystemTime::now());
@@ -451,48 +543,63 @@ impl PeerActor {
         }
     }
 
-    fn next_deadline(&self) -> Option<Timestamp> {
-        let handshake = self.handshake.map(|handshake| handshake.next_deadline());
-        let session = self
-            .session
-            .as_ref()
-            .map(|session| session.next_deadline(self.persistent_keepalive));
-        match (handshake, session) {
-            (Some(handshake), Some(session)) => Some(handshake.min(session)),
-            (handshake, session) => handshake.or(session),
+    /// The next persistent-keepalive deadline. It survives session expiry
+    /// and handshake abandonment so an unreachable peer keeps being retried,
+    /// but requires a known endpoint to send to.
+    fn persistent_keepalive_at(&self) -> Option<Timestamp> {
+        self.persistent_keepalive
+            .filter(|_| self.machine.endpoint().is_some())
+            .map(|interval| self.last_send + interval)
+    }
+
+    /// The in-flight handshake hit its retransmit deadline: retry, or give
+    /// up once attempts span Rekey-Attempt-Time.
+    async fn handshake_due(&mut self) {
+        let Some(handshake) = self.handshake else {
+            return;
+        };
+        let now = self.clock.now();
+        if now.duration_since(handshake.first_sent) >= REKEY_ATTEMPT_TIME {
+            debug!(
+                "[{}] handshake abandoned after {:?}",
+                self.label, REKEY_ATTEMPT_TIME
+            );
+            self.handshake = None;
+            self.staged.clear();
+            let abandoned = self.machine.abandon_handshake();
+            self.retire_index(abandoned);
+        } else {
+            self.send_handshake(handshake.first_sent).await;
         }
     }
 
-    async fn fire_due_timers(&mut self, now: Timestamp) {
-        if self.session.as_ref().is_some_and(|s| s.expired(now)) {
-            // the machine already refuses expired sessions; drop our timers
-            debug!("[{}] session expired", self.label);
-            self.session = None;
+    fn session_expired(&mut self) {
+        // the machine already refuses expired sessions; drop the timers
+        debug!("[{}] session expired", self.label);
+        self.session = None;
+    }
+
+    /// Data sent Keepalive-Timeout + Rekey-Timeout ago went unanswered:
+    /// assume the session died and negotiate a new one.
+    async fn new_handshake_due(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.new_handshake_at = None;
         }
-        if let Some(handshake) = self.handshake
-            && handshake.due(now)
-        {
-            if handshake.attempts_exhausted(now) {
-                debug!(
-                    "[{}] handshake abandoned after {:?}",
-                    self.label, REKEY_ATTEMPT_TIME
-                );
-                self.handshake = None;
-                self.staged.clear();
-                let abandoned = self.machine.abandon_handshake();
-                self.retire_index(abandoned);
-            } else {
-                self.send_handshake(handshake.first_sent()).await;
-            }
-        }
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
-        let due = session.due(now, self.persistent_keepalive);
-        if due.keepalive {
+        self.ensure_handshake().await;
+    }
+
+    /// The persistent-keepalive interval elapsed without an outbound packet.
+    /// Without a usable session the handshake takes the keepalive's place —
+    /// completing it confirms with a keepalive — so an unreachable peer
+    /// keeps being retried.
+    async fn persistent_keepalive_due(&mut self) {
+        let now = self.clock.now();
+        // advance the timer before attempting anything so a failed send
+        // waits out the interval instead of spinning
+        self.last_send = now;
+        if self.session.as_ref().is_some_and(|s| s.usable(now)) {
             self.send_keepalive().await;
-        }
-        if due.new_handshake {
+        } else {
             self.ensure_handshake().await;
         }
     }
@@ -502,11 +609,12 @@ impl PeerActor {
         let mut actions = Vec::with_capacity(BATCH_SIZE);
         let mut payloads = Vec::with_capacity(BATCH_SIZE);
         loop {
-            let now = self.clock.now();
-            self.fire_due_timers(now).await;
-            let wait = self
-                .next_deadline()
-                .map(|deadline| deadline.duration_since(now));
+            let handshake_at = self.handshake.map(|handshake| handshake.retry_at);
+            let session = self.session.as_ref();
+            let expires_at = session.map(|session| session.expires_at);
+            let keepalive_at = session.and_then(|session| session.keepalive_at);
+            let new_handshake_at = session.and_then(|session| session.new_handshake_at);
+            let persistent_at = self.persistent_keepalive_at();
             select! {
                 n = rx.recv_many(&mut actions, BATCH_SIZE) => {
                     if n == 0 {
@@ -524,22 +632,38 @@ impl PeerActor {
                     }
                     self.flush_sends(&mut payloads).await;
                 }
-                () = wait_until(wait) => {}
+                () = self.clock.sleep_until(handshake_at), if handshake_at.is_some() => {
+                    self.handshake_due().await;
+                }
+                () = self.clock.sleep_until(expires_at), if expires_at.is_some() => {
+                    self.session_expired();
+                }
+                () = self.clock.sleep_until(keepalive_at), if keepalive_at.is_some() => {
+                    self.send_keepalive().await;
+                }
+                () = self.clock.sleep_until(new_handshake_at), if new_handshake_at.is_some() => {
+                    self.new_handshake_due().await;
+                }
+                () = self.clock.sleep_until(persistent_at), if persistent_at.is_some() => {
+                    self.persistent_keepalive_due().await;
+                }
             }
         }
-    }
-}
-
-async fn wait_until(deadline: Option<Duration>) {
-    match deadline {
-        Some(deadline) => sleep(deadline).await,
-        None => pending().await,
     }
 }
 
 fn peer_label(key: &PublicKey) -> String {
     let b64 = key.to_string();
     format!("{}…{}", &b64[..4], &b64[39..43])
+}
+
+/// A single UDP sendmsg cannot carry more than 65,535 bytes even when GSO
+/// splits it into multiple datagrams; Linux rejects larger sends with
+/// EMSGSIZE, which quinn-udp does not treat as a cue to disable GSO.
+fn max_batch_segments(gso_segments: usize, segment_size: usize) -> usize {
+    gso_segments
+        .min(crate::MAX_MESSAGE_SIZE / segment_size)
+        .max(1)
 }
 
 /// Spawns the driver task for a registered peer and returns the watch that
@@ -569,6 +693,8 @@ pub(crate) fn spawn(
             clock: Clock::new(),
             control,
             persistent_keepalive: config.persistent_keepalive,
+            // a fresh clock starts at zero, so the timer arms from creation
+            last_send: Timestamp::default(),
             handshake: None,
             session: None,
             session_tx,
@@ -580,4 +706,210 @@ pub(crate) fn spawn(
         .run(actions),
     );
     session_rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::socket::UdpSocket;
+
+    async fn test_actor(persistent_keepalive: Option<Duration>) -> PeerActor {
+        let peer_key = PrivateKey::random().public_key();
+        let (control, _control_rx) = mpsc::unbounded_channel();
+        let (session_tx, _session_rx) = watch::channel(false);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let status = Arc::new(RwLock::new(PeerStatus {
+            public_key: peer_key.clone(),
+            endpoint: None,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            last_send: None,
+            last_recv: None,
+            last_successful_handshake: None,
+        }));
+        PeerActor {
+            label: "test".into(),
+            our_key: Arc::new(PrivateKey::random()),
+            machine: PeerState::new(peer_key),
+            clock: Clock::new(),
+            control,
+            persistent_keepalive,
+            last_send: Timestamp::default(),
+            handshake: None,
+            session: None,
+            session_tx,
+            staged: VecDeque::new(),
+            socket,
+            status,
+            inbound_tx,
+        }
+    }
+
+    // the persistent-keepalive deadline outlives sessions and handshakes: an
+    // unreachable peer keeps re-initiating instead of sleeping forever
+    #[tokio::test]
+    async fn persistent_keepalive_survives_without_a_session() {
+        let interval = Duration::from_secs(25);
+        let mut actor = test_actor(Some(interval)).await;
+
+        // without an endpoint there is nothing to keep alive
+        assert_eq!(actor.persistent_keepalive_at(), None);
+
+        let endpoint = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        actor.machine.set_endpoint(endpoint.local_addr().unwrap());
+        assert_eq!(
+            actor.persistent_keepalive_at(),
+            Some(Timestamp::default() + interval),
+            "armed with no session and no handshake"
+        );
+
+        // firing with no session initiates a handshake and leaves the next
+        // deadline in the clock's future so a failed attempt cannot spin
+        actor.persistent_keepalive_due().await;
+        assert!(actor.handshake.is_some());
+        assert!(actor.status.read().unwrap().tx_bytes > 0);
+        assert!(actor.persistent_keepalive_at().unwrap() > actor.clock.now());
+    }
+
+    // retransmits anchor to the first attempt; the whole attempt is
+    // abandoned once it spans Rekey-Attempt-Time
+    #[tokio::test(start_paused = true)]
+    async fn handshake_abandoned_after_attempt_time() {
+        let mut actor = test_actor(None).await;
+        let endpoint = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        actor.machine.set_endpoint(endpoint.local_addr().unwrap());
+
+        actor.ensure_handshake().await;
+        let first = actor.handshake.expect("handshake in flight");
+        assert!(first.retry_at >= Timestamp::default() + REKEY_TIMEOUT);
+        assert!(first.retry_at < Timestamp::default() + REKEY_TIMEOUT + REKEY_TIMEOUT_JITTER_MAX);
+
+        // within the window: due fires a fresh initiation, same anchor
+        actor.handshake_due().await;
+        assert_eq!(
+            actor.handshake.expect("retransmitted").first_sent,
+            first.first_sent
+        );
+
+        tokio::time::advance(REKEY_ATTEMPT_TIME).await;
+        actor.handshake_due().await;
+        assert!(actor.handshake.is_none(), "abandoned");
+    }
+
+    #[test]
+    fn rekey_jitter_stays_within_the_spec_bound() {
+        for _ in 0..100 {
+            assert!(rekey_jitter() < REKEY_TIMEOUT_JITTER_MAX);
+        }
+    }
+
+    #[test]
+    fn an_idle_session_only_expires() {
+        let now = Timestamp::default();
+        let session = Session::new(true, now);
+        assert_eq!(session.expires_at, now + REJECT_AFTER_TIME);
+        assert_eq!(session.keepalive_at, None);
+        assert_eq!(session.new_handshake_at, None);
+        assert!(session.usable(now));
+        assert!(!session.usable(now + REJECT_AFTER_TIME));
+    }
+
+    #[test]
+    fn received_payload_owes_a_passive_keepalive() {
+        let now = Timestamp::default();
+        let mut session = Session::new(false, now);
+
+        session.packet_received(now, false);
+        assert_eq!(session.keepalive_at, None);
+
+        session.packet_received(now, true);
+        assert_eq!(session.keepalive_at, Some(now + KEEPALIVE_TIMEOUT));
+
+        session.keepalive_sent();
+        assert_eq!(session.keepalive_at, None);
+    }
+
+    #[test]
+    fn unanswered_data_arms_a_new_handshake() {
+        let now = Timestamp::default();
+        let mut session = Session::new(true, now);
+        let earliest = now + KEEPALIVE_TIMEOUT + REKEY_TIMEOUT;
+
+        session.data_sent(now);
+        let deadline = session.new_handshake_at.expect("armed by data");
+        assert!(deadline >= earliest && deadline < earliest + REKEY_TIMEOUT_JITTER_MAX);
+
+        // further sends keep the original deadline
+        session.data_sent(now + Duration::from_secs(1));
+        assert_eq!(session.new_handshake_at, Some(deadline));
+
+        // an authenticated reply disarms it
+        session.packet_received(now + Duration::from_secs(2), false);
+        assert_eq!(session.new_handshake_at, None);
+    }
+
+    #[test]
+    fn keepalive_and_new_handshake_deadlines_are_exclusive() {
+        let now = Timestamp::default();
+        let mut session = Session::new(true, now);
+
+        session.packet_received(now, true);
+        assert_eq!(session.keepalive_at, Some(now + KEEPALIVE_TIMEOUT));
+        session.data_sent(now);
+        assert_eq!(session.keepalive_at, None);
+        assert!(session.new_handshake_at.is_some());
+
+        session.packet_received(now, true);
+        assert_eq!(session.new_handshake_at, None);
+        assert_eq!(session.keepalive_at, Some(now + KEEPALIVE_TIMEOUT));
+    }
+
+    #[test]
+    fn initiator_rekeys_before_session_expiry() {
+        let now = Timestamp::default();
+        let initiator = Session::new(true, now);
+        let responder = Session::new(false, now);
+
+        let send_at = now + REKEY_AFTER_TIME;
+        assert!(!initiator.rekey_after_send(now + (REKEY_AFTER_TIME - Duration::from_millis(1))));
+        assert!(initiator.rekey_after_send(send_at));
+        assert!(!responder.rekey_after_send(send_at));
+
+        let recv_at = now + REKEY_AFTER_TIME_RECEIVING;
+        assert!(
+            !initiator
+                .rekey_after_receive(now + (REKEY_AFTER_TIME_RECEIVING - Duration::from_millis(1)))
+        );
+        assert!(initiator.rekey_after_receive(recv_at));
+        assert!(!responder.rekey_after_receive(recv_at));
+    }
+
+    // GSO batches must respect the 65,535-byte sendmsg limit, not just the
+    // platform's segment count
+    #[test]
+    fn gso_batches_stay_under_the_udp_send_limit() {
+        let mtu_sized = Transport::packet_len(1420);
+        let limit = max_batch_segments(64, mtu_sized);
+        assert!(limit * mtu_sized <= crate::MAX_MESSAGE_SIZE);
+        assert!((limit + 1) * mtu_sized > crate::MAX_MESSAGE_SIZE);
+
+        // small packets are bounded by the platform segment count
+        assert_eq!(max_batch_segments(64, Transport::packet_len(0)), 64);
+
+        // a maximum-size packet still forms a batch of one
+        assert_eq!(max_batch_segments(64, crate::MAX_MESSAGE_SIZE), 1);
+    }
+
+    // without persistent keepalive, a peer with no session and no handshake
+    // has nothing scheduled (it only reacts to traffic and commands)
+    #[tokio::test]
+    async fn idle_peer_has_no_deadline() {
+        let mut actor = test_actor(None).await;
+        let endpoint = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        actor.machine.set_endpoint(endpoint.local_addr().unwrap());
+        assert_eq!(actor.persistent_keepalive_at(), None);
+        assert!(actor.handshake.is_none());
+        assert!(actor.session.is_none());
+    }
 }
