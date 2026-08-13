@@ -18,10 +18,11 @@ const PEER_ACTION_QUEUE_CAPACITY: usize = 1024;
 
 /// An index-routing update for the read loop's [`IndexRouter`].
 pub(crate) enum Control {
-    /// Route `index` to the registered peer's actor.
+    /// Route `index` to the registered peer's actor if no other peer holds
+    /// it.
     Bind(PublicKey, u32),
-    /// Stop routing `index`.
-    Retire(u32),
+    /// Stop routing `index` if it still routes to this peer.
+    Retire(PublicKey, u32),
     /// Drop every index routed to this removed peer's actor.
     Purge(mpsc::Sender<PeerAction>),
 }
@@ -138,16 +139,24 @@ impl IndexRouter {
     pub(crate) fn apply(&mut self, control: Control, peers: &RoutingTable) {
         match control {
             Control::Bind(peer_key, index) => {
-                // a bind racing a removal must not route to the dead actor;
-                // the registry entry is removed before the purge is sent, so
-                // a late bind finds no entry here
                 let Some(entry) = peers.entry(&peer_key) else {
                     return;
                 };
-                self.indices.insert(index, entry.actions.clone());
+                self.indices
+                    .entry(index)
+                    .or_insert_with(|| entry.actions.clone());
             }
-            Control::Retire(index) => {
-                self.indices.remove(&index);
+            Control::Retire(peer_key, index) => {
+                let Some(entry) = peers.entry(&peer_key) else {
+                    return;
+                };
+                if self
+                    .indices
+                    .get(&index)
+                    .is_some_and(|sender| sender.same_channel(&entry.actions))
+                {
+                    self.indices.remove(&index);
+                }
             }
             Control::Purge(actions) => {
                 self.indices.retain(|_, s| !s.same_channel(&actions));
@@ -221,6 +230,31 @@ mod tests {
             queued += 1;
         }
         assert_eq!(queued, PEER_ACTION_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn require_unique_indices() {
+        let (router, _control) = table();
+        let key_a = PrivateKey::random().public_key();
+        let key_b = PrivateKey::random().public_key();
+        let (mut actions_a, _entry_a) = router.register_peer(key_a.clone()).unwrap();
+        let (mut actions_b, _entry_b) = router.register_peer(key_b.clone()).unwrap();
+
+        let mut indices = IndexRouter::new();
+        indices.apply(Control::Bind(key_a.clone(), 7), &router);
+        indices.apply(Control::Bind(key_b.clone(), 7), &router);
+
+        indices.recv_data("127.0.0.1:1".parse().unwrap(), 7, b"data".to_vec());
+        assert!(actions_a.try_recv().is_ok());
+        assert!(actions_b.try_recv().is_err());
+
+        indices.apply(Control::Retire(key_b, 7), &router);
+        indices.recv_data("127.0.0.1:1".parse().unwrap(), 7, b"data".to_vec());
+        assert!(actions_a.try_recv().is_ok());
+
+        indices.apply(Control::Retire(key_a.clone(), 7), &router);
+        indices.recv_data("127.0.0.1:1".parse().unwrap(), 7, b"data".to_vec());
+        assert!(actions_a.try_recv().is_err());
     }
 
     // a bind that loses the race with a removal must not plant a route to

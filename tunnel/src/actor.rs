@@ -175,7 +175,9 @@ impl PeerActor {
 
     fn retire_index(&self, index: Option<u32>) {
         if let Some(index) = index {
-            let _ = self.control.send(Control::Retire(index));
+            let _ = self
+                .control
+                .send(Control::Retire(self.machine.peer_key().clone(), index));
         }
     }
 
