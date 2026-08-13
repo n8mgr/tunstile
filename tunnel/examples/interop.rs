@@ -38,8 +38,8 @@ async fn main() {
 
     println!("rust public key: {}", args.key.public_key());
 
-    let tunnel = Tunnel::new(args.bind, args.key.clone()).await.unwrap();
-    let mut peer = tunnel
+    let mut tunnel = Tunnel::new(args.bind, args.key.clone()).await.unwrap();
+    let peer = tunnel
         .add_peer(
             &args.peer,
             PeerConfig {
@@ -75,16 +75,12 @@ async fn main() {
                     status.rx_bytes
                 );
             }
-            data = peer.recv() => {
-                let Some(data) = data else {
-                    println!("peer closed");
-                    break;
-                };
+            packet = tunnel.recv() => {
                 println!(
                     "[{:>3}s] recv {} bytes: {}",
                     started.elapsed().as_secs(),
-                    data.len(),
-                    String::from_utf8_lossy(&data)
+                    packet.payload.len(),
+                    String::from_utf8_lossy(&packet.payload)
                 );
             }
         }

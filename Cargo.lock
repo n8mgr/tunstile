@@ -1407,7 +1407,6 @@ dependencies = [
  "criterion",
  "env_logger",
  "etherparse",
- "futures-core",
  "log",
  "quinn-udp",
  "rand",

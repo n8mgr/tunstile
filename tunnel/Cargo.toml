@@ -8,7 +8,6 @@ repository = "https://github.com/n8mgr/tunstile"
 keywords = ["wireguard", "vpn", "tunnel", "networking"]
 
 [dependencies]
-futures-core = "0.3.32"
 log = "0.4.33"
 quinn-udp = { version = "0.6.1", features = ["fast-apple-datapath"] }
 rand = "0.10.2"

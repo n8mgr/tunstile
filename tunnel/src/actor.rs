@@ -5,7 +5,7 @@ use std::{
     collections::VecDeque,
     future::pending,
     net::SocketAddr,
-    sync::{Arc, RwLock, Weak},
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime},
 };
 
@@ -27,14 +27,13 @@ use tunstile_protocol::{
     transport::Transport,
 };
 
-use crate::{PeerConfig, PeerStatus, peer, router::RoutingTable, socket::UdpSocket};
+use crate::{Packet, PeerConfig, PeerStatus, router::Control, socket::UdpSocket};
 
 mod timers;
 
 use timers::{HandshakeTimers, SessionTimers};
 
 const MAX_STAGED_PACKETS: usize = 128;
-const PEER_INBOUND_QUEUE: usize = 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Clock {
@@ -69,8 +68,8 @@ struct PeerActor {
     machine: PeerState,
     clock: Clock,
 
-    // weak so dropping the Tunnel terminates the peer actors
-    router: Weak<RoutingTable>,
+    // index-routing updates for the read loop
+    control: mpsc::UnboundedSender<Control>,
 
     persistent_keepalive: Option<Duration>,
     handshake: Option<HandshakeTimers>,
@@ -83,7 +82,7 @@ struct PeerActor {
 
     status: Arc<RwLock<PeerStatus>>,
 
-    data_tx: Sender<Vec<u8>>,
+    inbound_tx: Sender<Packet>,
 }
 
 impl PeerActor {
@@ -96,9 +95,15 @@ impl PeerActor {
     }
 
     fn retire_index(&self, index: Option<u32>) {
-        if let (Some(index), Some(router)) = (index, self.router.upgrade()) {
-            router.retire_index(index);
+        if let Some(index) = index {
+            let _ = self.control.send(Control::Retire(index));
         }
+    }
+
+    fn bind_index(&self, index: u32) {
+        let _ = self
+            .control
+            .send(Control::Bind(self.machine.peer_key().clone(), index));
     }
 
     /// Sends a fresh handshake initiation. Retransmits pass the original
@@ -124,9 +129,7 @@ impl PeerActor {
             }
         };
         self.retire_index(replaced);
-        if let Some(router) = self.router.upgrade() {
-            router.bind_index(self.machine.peer_key(), index);
-        }
+        self.bind_index(index);
         if let Err(e) = self.socket.send(endpoint, &msg).await {
             debug!(
                 "[{}] failed to send handshake initiation: {:?}",
@@ -214,8 +217,12 @@ impl PeerActor {
                         if let Some(payload) = payload {
                             // drop on a full queue rather than await: a slow or absent
                             // reader must not stall the actor's timers and handshakes
+                            let packet = Packet {
+                                public_key: self.machine.peer_key().clone(),
+                                payload,
+                            };
                             if let Err(mpsc::error::TrySendError::Full(_)) =
-                                self.data_tx.try_send(payload)
+                                self.inbound_tx.try_send(packet)
                             {
                                 debug!(
                                     "[{}] dropping inbound packet: receive queue full",
@@ -252,9 +259,7 @@ impl PeerActor {
                     }
                 };
                 self.retire_index(displaced);
-                if let Some(router) = self.router.upgrade() {
-                    router.bind_index(self.machine.peer_key(), index);
-                }
+                self.bind_index(index);
                 if let Err(e) = self.socket.send(endpoint, &msg).await {
                     debug!(
                         "[{}] failed to send handshake response: {:?}",
@@ -537,20 +542,21 @@ fn peer_label(key: &PublicKey) -> String {
     format!("{}…{}", &b64[..4], &b64[39..43])
 }
 
-/// Spawns the driver task for a registered peer and returns its handle.
+/// Spawns the driver task for a registered peer and returns the watch that
+/// reports its session readiness.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     our_key: Arc<PrivateKey>,
     public_key: PublicKey,
     config: &PeerConfig,
-    router: Weak<RoutingTable>,
+    control: mpsc::UnboundedSender<Control>,
     socket: Arc<UdpSocket>,
     status: Arc<RwLock<PeerStatus>>,
     actions: Receiver<PeerAction>,
-) -> peer::Peer {
-    let (data_tx, data_rx) = mpsc::channel(PEER_INBOUND_QUEUE);
+    inbound_tx: Sender<Packet>,
+) -> watch::Receiver<bool> {
     let (session_tx, session_rx) = watch::channel(false);
     let label = peer_label(&public_key);
-    let peer_key = public_key.clone();
     let mut machine = PeerState::new(public_key);
     if let Some(psk) = config.preshared_key.clone() {
         machine = machine.preshared_key(psk);
@@ -561,17 +567,17 @@ pub(crate) fn spawn(
             our_key,
             machine,
             clock: Clock::new(),
-            router: router.clone(),
+            control,
             persistent_keepalive: config.persistent_keepalive,
             handshake: None,
             session: None,
             session_tx,
             staged: VecDeque::new(),
             socket,
-            status: status.clone(),
-            data_tx,
+            status,
+            inbound_tx,
         }
         .run(actions),
     );
-    peer::Peer::new(peer_key, router, status, session_rx, data_rx)
+    session_rx
 }

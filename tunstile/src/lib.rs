@@ -44,7 +44,6 @@ use std::{
 
 use log::debug;
 use thiserror::Error;
-use tokio::{spawn, sync::mpsc, task::JoinHandle};
 use tunstile_tunnel::{
     MAX_PLAINTEXT_SIZE, Peer, PeerSender, RegisterError, TRANSPORT_PADDING_MULTIPLE, Tunnel,
 };
@@ -56,8 +55,6 @@ pub use ipnet::IpNet;
 pub use tunstile_tunnel::{
     KeyParseError, PeerStatus, PresharedKey, PrivateKey, PublicKey, SendError,
 };
-
-const PACKET_QUEUE_CAPACITY: usize = 1024;
 
 /// Error creating or operating a device.
 #[derive(Debug, Error)]
@@ -83,30 +80,17 @@ pub enum DeviceError {
 pub struct Device {
     tunnel: Tunnel,
     max_packet_size: usize,
-    peers: HashMap<PublicKey, PeerEntry>,
+    peers: HashMap<PublicKey, Peer>,
     allowed_ips: allowed_ips::AllowedIps<PeerSender>,
-    inbound_tx: mpsc::Sender<(PublicKey, Vec<u8>)>,
-    inbound_rx: mpsc::Receiver<(PublicKey, Vec<u8>)>,
-}
-
-impl Drop for Device {
-    fn drop(&mut self) {
-        for (_, entry) in self.peers.drain() {
-            entry.task.abort();
-        }
-    }
 }
 
 impl Device {
     fn start(tunnel: Tunnel, max_packet_size: usize) -> Self {
-        let (inbound_tx, inbound_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
         Self {
             tunnel,
             max_packet_size: max_packet_size.min(MAX_PLAINTEXT_SIZE),
             peers: HashMap::new(),
             allowed_ips: allowed_ips::AllowedIps::new(),
-            inbound_tx,
-            inbound_rx,
         }
     }
 
@@ -210,18 +194,19 @@ impl Device {
     /// Receives the next authenticated inbound IP packet after validating its
     /// declared length, removing WireGuard padding, and checking that its
     /// source address routes back to the delivering peer.
-    pub async fn recv_packet(&mut self) -> Option<Vec<u8>> {
+    pub async fn recv_packet(&mut self) -> Vec<u8> {
         loop {
-            let (public_key, mut packet) = self.inbound_rx.recv().await?;
-            let Some(info) = packet_info(&packet) else {
+            let packet = self.tunnel.recv().await;
+            let mut payload = packet.payload;
+            let Some(info) = packet_info(&payload) else {
                 debug!("dropping invalid inbound packet");
                 continue;
             };
-            packet.truncate(info.len);
+            payload.truncate(info.len);
             let valid_source = self
                 .allowed_ips
                 .longest_match(info.source)
-                .is_some_and(|sender| *sender.public_key() == public_key);
+                .is_some_and(|sender| *sender.public_key() == packet.public_key);
             if !valid_source {
                 debug!(
                     "inbound packet from unexpected source {}; dropping",
@@ -229,7 +214,7 @@ impl Device {
                 );
                 continue;
             }
-            return Some(packet);
+            return payload;
         }
     }
 
@@ -254,10 +239,7 @@ impl Device {
         for net in peer_allowed_ips {
             self.allowed_ips.insert(net, sender.clone());
         }
-        let task = spawn(inbound_loop(self.inbound_tx.clone(), peer));
-        let previous = self
-            .peers
-            .insert(public_key.clone(), PeerEntry { sender, task });
+        let previous = self.peers.insert(public_key.clone(), peer);
         debug_assert!(previous.is_none());
         Ok(())
     }
@@ -275,7 +257,7 @@ impl Device {
         let sender = self
             .peers
             .get(public_key)
-            .map(|entry| entry.sender.clone())
+            .map(Peer::sender)
             .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
 
         let (tunnel_config, peer_allowed_ips) = config.take_tunnel();
@@ -296,40 +278,22 @@ impl Device {
         public_key: &PublicKey,
         endpoint: SocketAddr,
     ) -> Result<(), DeviceError> {
-        let sender = self
+        let peer = self
             .peers
             .get(public_key)
-            .map(|entry| entry.sender.clone())
             .ok_or_else(|| DeviceError::UnknownPeer(public_key.clone()))?;
-        sender.connect(endpoint).await?;
+        peer.connect(endpoint).await?;
         Ok(())
     }
 
     /// Unregisters a peer and removes its AllowedIPs.
-    pub async fn remove_peer(&mut self, public_key: &PublicKey) -> bool {
-        let entry = self.peers.remove(public_key);
-        let Some(entry) = entry else {
+    pub fn remove_peer(&mut self, public_key: &PublicKey) -> bool {
+        if self.peers.remove(public_key).is_none() {
             return false;
-        };
+        }
         self.allowed_ips
             .retain(|sender| sender.public_key() != public_key);
-        entry.task.abort();
-        let _ = entry.task.await;
         true
-    }
-}
-
-struct PeerEntry {
-    sender: PeerSender,
-    task: JoinHandle<()>,
-}
-
-async fn inbound_loop(inbound: mpsc::Sender<(PublicKey, Vec<u8>)>, mut peer: Peer) {
-    let public_key = peer.public_key().clone();
-    while let Some(packet) = peer.recv().await {
-        if inbound.send((public_key.clone(), packet)).await.is_err() {
-            break;
-        }
     }
 }
 
@@ -569,16 +533,14 @@ mod tests {
         let received =
             tokio::time::timeout(std::time::Duration::from_secs(5), device_b.recv_packet())
                 .await
-                .expect("device B did not receive a packet")
-                .unwrap();
+                .expect("device B did not receive a packet");
         assert_eq!(received, a_to_b);
 
         device_b.send_packet(b_to_a.clone()).await.unwrap();
         let received =
             tokio::time::timeout(std::time::Duration::from_secs(5), device_a.recv_packet())
                 .await
-                .expect("device A did not receive a packet")
-                .unwrap();
+                .expect("device A did not receive a packet");
         assert_eq!(received, b_to_a);
 
         device_a
@@ -598,8 +560,7 @@ mod tests {
         let received =
             tokio::time::timeout(std::time::Duration::from_secs(5), device_b.recv_packet())
                 .await
-                .expect("device B did not receive a rerouted packet")
-                .unwrap();
+                .expect("device B did not receive a rerouted packet");
         assert_eq!(received, rerouted);
 
         let reconfigured_source = ipv4_packet([10, 0, 0, 3], [10, 0, 0, 1]);
@@ -610,12 +571,11 @@ mod tests {
         let received =
             tokio::time::timeout(std::time::Duration::from_secs(5), device_a.recv_packet())
                 .await
-                .expect("device A did not accept the reconfigured source")
-                .unwrap();
+                .expect("device A did not accept the reconfigured source");
         assert_eq!(received, reconfigured_source);
 
-        assert!(device_a.remove_peer(&public_b).await);
-        assert!(!device_a.remove_peer(&public_b).await);
+        assert!(device_a.remove_peer(&public_b));
+        assert!(!device_a.remove_peer(&public_b));
         assert!(device_a.peer(&public_b).is_none());
         assert!(matches!(
             device_a

@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use tokio::sync::mpsc::{self, Sender, error::TrySendError};
+use tokio::sync::mpsc;
 use tunstile_protocol::{
     PublicKey,
     handshake::{Handshake, InitReceived},
@@ -16,49 +16,42 @@ use crate::{PeerStatus, SendError, actor::PeerAction};
 
 const PEER_ACTION_QUEUE_CAPACITY: usize = 1024;
 
-struct PeerEntry {
-    actions: mpsc::Sender<PeerAction>,
-    status: Arc<RwLock<PeerStatus>>,
+/// An index-routing update for the read loop's [`IndexRouter`].
+pub(crate) enum Control {
+    /// Route `index` to the registered peer's actor.
+    Bind(PublicKey, u32),
+    /// Stop routing `index`.
+    Retire(u32),
+    /// Drop every index routed to this removed peer's actor.
+    Purge(mpsc::Sender<PeerAction>),
 }
 
+pub(crate) struct PeerEntry {
+    pub(crate) actions: mpsc::Sender<PeerAction>,
+    pub(crate) status: Arc<RwLock<PeerStatus>>,
+}
+
+/// The peer registry, shared between the tunnel handle and the read loop.
+/// Peer handles hold weak entries, so per-packet sends never touch the
+/// registry lock; it is taken only to register, remove, or enumerate peers
+/// and to route handshake initiations.
 pub(crate) struct RoutingTable {
-    peer_indices: RwLock<HashMap<u32, mpsc::Sender<PeerAction>>>,
-    peers: RwLock<HashMap<PublicKey, PeerEntry>>,
+    peers: RwLock<HashMap<PublicKey, Arc<PeerEntry>>>,
+    control: mpsc::UnboundedSender<Control>,
 }
 
 impl RoutingTable {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(control: mpsc::UnboundedSender<Control>) -> Self {
         Self {
-            peer_indices: RwLock::new(HashMap::new()),
             peers: RwLock::new(HashMap::new()),
+            control,
         }
-    }
-
-    pub(crate) fn bind_index(&self, peer_key: &PublicKey, index: u32) {
-        let Some(sender) = self.peer_key_sender(peer_key) else {
-            return;
-        };
-        self.peer_indices.write().unwrap().insert(index, sender);
-    }
-
-    pub(crate) fn retire_index(&self, index: u32) {
-        self.peer_indices.write().unwrap().remove(&index);
-    }
-
-    pub(crate) fn remove_peer(&self, peer_key: &PublicKey) {
-        let Some(entry) = self.peers.write().unwrap().remove(peer_key) else {
-            return;
-        };
-        self.peer_indices
-            .write()
-            .unwrap()
-            .retain(|_, s| !s.same_channel(&entry.actions));
     }
 
     pub(crate) fn register_peer(
         &self,
         peer_key: PublicKey,
-    ) -> Option<(mpsc::Receiver<PeerAction>, Arc<RwLock<PeerStatus>>)> {
+    ) -> Option<(mpsc::Receiver<PeerAction>, Arc<PeerEntry>)> {
         let mut peers = self.peers.write().unwrap();
         if peers.contains_key(&peer_key) {
             return None;
@@ -73,29 +66,27 @@ impl RoutingTable {
             last_recv: None,
             last_successful_handshake: None,
         }));
-        peers.insert(
-            peer_key,
-            PeerEntry {
-                actions: tx,
-                status: status.clone(),
-            },
-        );
-        Some((rx, status))
+        let entry = Arc::new(PeerEntry {
+            actions: tx,
+            status,
+        });
+        peers.insert(peer_key, entry.clone());
+        Some((rx, entry))
     }
 
-    fn peer_key_sender(&self, public_key: &PublicKey) -> Option<Sender<PeerAction>> {
-        self.peers
-            .read()
-            .unwrap()
-            .get(public_key)
-            .map(|entry| entry.actions.clone())
+    pub(crate) fn remove_peer(&self, peer_key: &PublicKey) {
+        let Some(entry) = self.peers.write().unwrap().remove(peer_key) else {
+            return;
+        };
+        let _ = self.control.send(Control::Purge(entry.actions.clone()));
+    }
+
+    pub(crate) fn entry(&self, public_key: &PublicKey) -> Option<Arc<PeerEntry>> {
+        self.peers.read().unwrap().get(public_key).cloned()
     }
 
     pub(crate) fn peer_status(&self, public_key: &PublicKey) -> Option<PeerStatus> {
-        self.peers
-            .read()
-            .unwrap()
-            .get(public_key)
+        self.entry(public_key)
             .map(|entry| entry.status.read().unwrap().clone())
     }
 
@@ -108,71 +99,17 @@ impl RoutingTable {
             .collect()
     }
 
-    fn peer_index_sender(&self, index: u32) -> Option<Sender<PeerAction>> {
-        self.peer_indices.read().unwrap().get(&index).cloned()
-    }
-
-    async fn send_action(
-        &self,
-        public_key: &PublicKey,
-        action: PeerAction,
-    ) -> Result<(), SendError> {
-        let sender = self
-            .peer_key_sender(public_key)
-            .ok_or(SendError::PeerRemoved)?;
-        sender
-            .send(action)
-            .await
-            .map_err(|_| SendError::PeerRemoved)
-    }
-
-    fn try_send_to_index(&self, index: u32, action: PeerAction) {
-        if let Some(sender) = self.peer_index_sender(index) {
-            let _ = sender.try_send(action);
-        }
-    }
-
-    pub(crate) async fn connect(
-        &self,
-        public_key: &PublicKey,
-        endpoint: SocketAddr,
-    ) -> Result<(), SendError> {
-        self.send_action(public_key, PeerAction::Connect(endpoint))
-            .await
-    }
-
     pub(crate) async fn set_config(
         &self,
         public_key: &PublicKey,
         config: crate::PeerConfig,
     ) -> Result<(), SendError> {
-        self.send_action(public_key, PeerAction::SetConfig(config))
+        let entry = self.entry(public_key).ok_or(SendError::PeerRemoved)?;
+        entry
+            .actions
+            .send(PeerAction::SetConfig(config))
             .await
-    }
-
-    pub(crate) async fn send_data(
-        &self,
-        public_key: &PublicKey,
-        packet: Vec<u8>,
-    ) -> Result<(), SendError> {
-        self.send_action(public_key, PeerAction::SendData(packet))
-            .await
-    }
-
-    pub(crate) fn try_send_data(
-        &self,
-        public_key: &PublicKey,
-        packet: Vec<u8>,
-    ) -> Result<(), SendError> {
-        let sender = self
-            .peer_key_sender(public_key)
-            .ok_or(SendError::PeerRemoved)?;
-        sender
-            .try_send(PeerAction::SendData(packet))
-            .map_err(|error| match error {
-                TrySendError::Full(_) => SendError::Full,
-                TrySendError::Closed(_) => SendError::PeerRemoved,
-            })
+            .map_err(|_| SendError::PeerRemoved)
     }
 
     pub(crate) fn recv_handshake_init(
@@ -180,9 +117,58 @@ impl RoutingTable {
         endpoint: SocketAddr,
         handshake: Handshake<InitReceived>,
     ) {
-        if let Some(sender) = self.peer_key_sender(handshake.peer_key()) {
-            let _ = sender.try_send(PeerAction::RecvHandshakeInit(handshake, endpoint));
+        if let Some(entry) = self.entry(handshake.peer_key()) {
+            let _ = entry
+                .actions
+                .try_send(PeerAction::RecvHandshakeInit(handshake, endpoint));
         }
+    }
+}
+
+/// Receiver-index routing, owned exclusively by the read loop and updated
+/// through [`Control`] messages so no lock sits on the inbound packet path.
+pub(crate) struct IndexRouter {
+    indices: HashMap<u32, mpsc::Sender<PeerAction>>,
+}
+
+impl IndexRouter {
+    pub(crate) fn new() -> Self {
+        Self {
+            indices: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn apply(&mut self, control: Control, peers: &RoutingTable) {
+        match control {
+            Control::Bind(peer_key, index) => {
+                // a bind racing a removal must not route to the dead actor;
+                // the registry entry is removed before the purge is sent, so
+                // a late bind finds no entry here
+                let Some(entry) = peers.entry(&peer_key) else {
+                    return;
+                };
+                self.indices.insert(index, entry.actions.clone());
+            }
+            Control::Retire(index) => {
+                self.indices.remove(&index);
+            }
+            Control::Purge(actions) => {
+                self.indices.retain(|_, s| !s.same_channel(&actions));
+            }
+        }
+    }
+
+    fn try_send_to_index(&self, index: u32, action: PeerAction) {
+        if let Some(sender) = self.indices.get(&index) {
+            let _ = sender.try_send(action);
+        }
+    }
+
+    pub(crate) fn recv_data(&self, endpoint: SocketAddr, peer_index: u32, packet: Vec<u8>) {
+        self.try_send_to_index(
+            peer_index,
+            PeerAction::RecvData(packet, peer_index, endpoint),
+        );
     }
 
     pub(crate) fn recv_handshake_resp(
@@ -192,13 +178,6 @@ impl RoutingTable {
         packet: Vec<u8>,
     ) {
         self.try_send_to_index(peer_index, PeerAction::RecvHandshakeResp(packet, endpoint));
-    }
-
-    pub(crate) fn recv_data(&self, endpoint: SocketAddr, peer_index: u32, packet: Vec<u8>) {
-        self.try_send_to_index(
-            peer_index,
-            PeerAction::RecvData(packet, peer_index, endpoint),
-        );
     }
 
     pub(crate) fn recv_cookie_reply(&self, peer_index: u32, packet: Vec<u8>) {
@@ -211,22 +190,33 @@ mod tests {
     use super::*;
     use tunstile_protocol::PrivateKey;
 
+    fn table() -> (RoutingTable, mpsc::UnboundedReceiver<Control>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (RoutingTable::new(tx), rx)
+    }
+
     #[test]
     fn full_peer_queue_does_not_accept_network_input() {
-        let router = RoutingTable::new();
+        let (router, _control) = table();
         let public_key = PrivateKey::random().public_key();
-        let (mut actions, _) = router.register_peer(public_key.clone()).unwrap();
-        router.bind_index(&public_key, 7);
+        let (mut actions, entry) = router.register_peer(public_key.clone()).unwrap();
+        let mut indices = IndexRouter::new();
+        indices.apply(Control::Bind(public_key, 7), &router);
 
         for _ in 0..PEER_ACTION_QUEUE_CAPACITY {
-            assert_eq!(router.try_send_data(&public_key, Vec::new()), Ok(()));
+            entry
+                .actions
+                .try_send(PeerAction::SendData(Vec::new()))
+                .unwrap();
         }
 
-        assert_eq!(
-            router.try_send_data(&public_key, Vec::new()),
-            Err(SendError::Full)
+        assert!(
+            entry
+                .actions
+                .try_send(PeerAction::SendData(Vec::new()))
+                .is_err()
         );
-        router.recv_data("127.0.0.1:1".parse().unwrap(), 7, Vec::new());
+        indices.recv_data("127.0.0.1:1".parse().unwrap(), 7, Vec::new());
 
         let mut queued = 0;
         while let Ok(action) = actions.try_recv() {
@@ -234,5 +224,20 @@ mod tests {
             queued += 1;
         }
         assert_eq!(queued, PEER_ACTION_QUEUE_CAPACITY);
+    }
+
+    // a bind that loses the race with a removal must not plant a route to
+    // the dead actor
+    #[test]
+    fn bind_after_removal_is_ignored() {
+        let (router, _control) = table();
+        let public_key = PrivateKey::random().public_key();
+        let (mut actions, _entry) = router.register_peer(public_key.clone()).unwrap();
+        router.remove_peer(&public_key);
+
+        let mut indices = IndexRouter::new();
+        indices.apply(Control::Bind(public_key, 7), &router);
+        indices.recv_data("127.0.0.1:1".parse().unwrap(), 7, b"data".to_vec());
+        assert!(actions.try_recv().is_err());
     }
 }

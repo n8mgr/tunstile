@@ -11,8 +11,9 @@ fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
 
-// the tunnels are returned so the caller keeps their read loops alive
-type Established = (Tunnel, Tunnel, Arc<Peer>, Arc<Mutex<Peer>>);
+// the tunnels keep their read loops alive; the peer handles keep the
+// registrations alive
+type Established = (Tunnel, Arc<Mutex<Tunnel>>, Arc<Peer>, Peer);
 
 fn setup(rt: &Runtime) -> Established {
     let _ = env_logger::try_init();
@@ -44,9 +45,9 @@ fn setup(rt: &Runtime) -> Established {
 
         (
             tunnel_a,
-            tunnel_b,
+            Arc::new(Mutex::new(tunnel_b)),
             Arc::new(peer_b),
-            Arc::new(Mutex::new(peer_a)),
+            peer_a,
         )
     })
 }
@@ -54,7 +55,7 @@ fn setup(rt: &Runtime) -> Established {
 // Latency-bound: reports per-packet round-trip cost, not throughput.
 fn bench_roundtrip(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let (_tunnel_a, _tunnel_b, peer_b, peer_a) = setup(&rt);
+    let (_tunnel_a, tunnel_b, peer_b, _peer_a) = setup(&rt);
     let payload = vec![0xABu8; PAYLOAD_LEN];
 
     let mut group = c.benchmark_group("tunnel");
@@ -64,10 +65,10 @@ fn bench_roundtrip(c: &mut Criterion) {
             || payload.clone(),
             |payload| {
                 let peer_b = peer_b.clone();
-                let peer_a = peer_a.clone();
+                let tunnel_b = tunnel_b.clone();
                 async move {
                     peer_b.send(payload).await.unwrap();
-                    peer_a.lock().await.recv().await.unwrap();
+                    tunnel_b.lock().await.recv().await;
                 }
             },
             BatchSize::SmallInput,
@@ -80,7 +81,7 @@ fn bench_roundtrip(c: &mut Criterion) {
 // deeper than BATCH, keeping this lossless; reports saturated throughput.
 fn bench_pipelined(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let (_tunnel_a, _tunnel_b, peer_b, peer_a) = setup(&rt);
+    let (_tunnel_a, tunnel_b, peer_b, _peer_a) = setup(&rt);
     let payload = vec![0xABu8; PAYLOAD_LEN];
 
     let mut group = c.benchmark_group("tunnel");
@@ -90,7 +91,7 @@ fn bench_pipelined(c: &mut Criterion) {
             || vec![payload.clone(); BATCH],
             |payloads| {
                 let peer_b = peer_b.clone();
-                let peer_a = peer_a.clone();
+                let tunnel_b = tunnel_b.clone();
                 async move {
                     let send_all = async {
                         for payload in payloads {
@@ -98,9 +99,9 @@ fn bench_pipelined(c: &mut Criterion) {
                         }
                     };
                     let recv_all = async {
-                        let mut rx = peer_a.lock().await;
+                        let mut rx = tunnel_b.lock().await;
                         for _ in 0..BATCH {
-                            rx.recv().await.unwrap();
+                            rx.recv().await;
                         }
                     };
                     tokio::join!(send_all, recv_all);

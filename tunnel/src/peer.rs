@@ -2,25 +2,27 @@
 
 use std::{
     net::SocketAddr,
-    pin::Pin,
     sync::{Arc, RwLock, Weak},
-    task::{Context, Poll},
 };
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc::error::TrySendError, watch};
 use tunstile_protocol::PublicKey;
 
-use crate::{PeerStatus, SendError, router::RoutingTable};
+use crate::{
+    PeerStatus, SendError,
+    actor::PeerAction,
+    router::{PeerEntry, RoutingTable},
+};
 
-/// A handle to a registered peer: the owned receive half of its inbound
-/// queue plus its send and status operations. The handle is the
-/// registration — dropping it removes the peer from the tunnel.
+/// A handle to a registered peer: its send, connect, and status operations.
+/// Decrypted payloads arrive through [`Tunnel::recv`](crate::Tunnel::recv).
+/// The handle is the registration — dropping it removes the peer from the
+/// tunnel.
 #[must_use = "dropping the Peer unregisters it from the tunnel"]
 pub struct Peer {
     sender: PeerSender,
     status: Arc<RwLock<PeerStatus>>,
     session_rx: watch::Receiver<bool>,
-    data_rx: mpsc::Receiver<Vec<u8>>,
 }
 
 impl Drop for Peer {
@@ -35,15 +37,18 @@ impl Peer {
     pub(crate) fn new(
         public_key: PublicKey,
         router: Weak<RoutingTable>,
+        entry: Weak<PeerEntry>,
         status: Arc<RwLock<PeerStatus>>,
         session_rx: watch::Receiver<bool>,
-        data_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Self {
         Self {
-            sender: PeerSender { public_key, router },
+            sender: PeerSender {
+                public_key,
+                router,
+                entry,
+            },
             status,
             session_rx,
-            data_rx,
         }
     }
 
@@ -55,12 +60,6 @@ impl Peer {
     /// Current status snapshot for this peer.
     pub fn status(&self) -> PeerStatus {
         self.status.read().unwrap().clone()
-    }
-
-    /// Receives the next decrypted payload from this peer. Returns `None`
-    /// once the peer is removed or the tunnel is dropped.
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.data_rx.recv().await
     }
 
     /// Sends a payload to this peer, waiting for queue capacity. Pre-session
@@ -99,23 +98,24 @@ impl Peer {
     }
 }
 
-impl futures_core::Stream for Peer {
-    type Item = Vec<u8>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().data_rx.poll_recv(cx)
-    }
-}
-
-/// A cloneable handle for sending to a peer, decoupled from its inbound
-/// queue so many callers can share the send path.
+/// A cloneable handle for sending to a peer. Unlike [`Peer`] it does not own
+/// the registration, so many callers can share the send path.
 #[derive(Clone)]
 pub struct PeerSender {
     public_key: PublicKey,
     router: Weak<RoutingTable>,
+    entry: Weak<PeerEntry>,
 }
 
 impl PeerSender {
+    fn entry(&self) -> Result<Arc<PeerEntry>, SendError> {
+        match self.entry.upgrade() {
+            Some(entry) => Ok(entry),
+            None if self.router.upgrade().is_some() => Err(SendError::PeerRemoved),
+            None => Err(SendError::TunnelClosed),
+        }
+    }
+
     /// The peer's public key.
     pub fn public_key(&self) -> &PublicKey {
         &self.public_key
@@ -124,26 +124,39 @@ impl PeerSender {
     /// Sends a payload to the peer, waiting for queue capacity. Pre-session
     /// staging is bounded and may discard older payloads.
     pub async fn send(&self, payload: Vec<u8>) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.send_data(&self.public_key, payload).await
+        self.entry()?
+            .actions
+            .send(PeerAction::SendData(payload))
+            .await
+            .map_err(|_| SendError::PeerRemoved)
     }
 
     /// Sends a payload immediately, returning [`SendError::Full`] instead of
     /// waiting when this peer's queue has no capacity.
     pub fn try_send(&self, payload: Vec<u8>) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.try_send_data(&self.public_key, payload)
+        self.entry()?
+            .actions
+            .try_send(PeerAction::SendData(payload))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => SendError::Full,
+                TrySendError::Closed(_) => SendError::PeerRemoved,
+            })
     }
 
     /// Updates the peer's endpoint and initiates a handshake if none is in
     /// flight.
     pub async fn connect(&self, endpoint: SocketAddr) -> Result<(), SendError> {
-        let router = self.router.upgrade().ok_or(SendError::TunnelClosed)?;
-        router.connect(&self.public_key, endpoint).await
+        self.entry()?
+            .actions
+            .send(PeerAction::Connect(endpoint))
+            .await
+            .map_err(|_| SendError::PeerRemoved)
     }
 
     /// Current status snapshot, or `None` if the peer is no longer registered.
     pub fn status(&self) -> Option<PeerStatus> {
-        self.router.upgrade()?.peer_status(&self.public_key)
+        self.entry
+            .upgrade()
+            .map(|entry| entry.status.read().unwrap().clone())
     }
 }

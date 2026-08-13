@@ -120,9 +120,6 @@ async fn run_packets(
                 recv.set(recv_tun(tun, mtu));
             }
             packet = device.recv_packet() => {
-                let Some(packet) = packet else {
-                    return Ok(());
-                };
                 tun.send(&packet).await?;
             }
         }

@@ -40,7 +40,7 @@ use std::{
 use log::debug;
 use quinn_udp::{BATCH_SIZE, RecvMeta};
 use thiserror::Error;
-use tokio::{spawn, task::JoinHandle};
+use tokio::{select, spawn, sync::mpsc, task::JoinHandle};
 pub use tunstile_protocol::transport::TRANSPORT_PADDING_MULTIPLE;
 pub use tunstile_protocol::{KeyParseError, PresharedKey, PrivateKey, PublicKey};
 use tunstile_protocol::{
@@ -58,11 +58,12 @@ mod socket;
 
 use actor::Clock;
 pub use peer::{Peer, PeerSender};
-use router::RoutingTable;
+use router::{Control, IndexRouter, RoutingTable};
 use socket::UdpSocket;
 
 const MAX_MESSAGE_SIZE: usize = 65535;
 const MAX_IPV4_UDP_PAYLOAD_SIZE: usize = 65_507;
+const INBOUND_QUEUE_CAPACITY: usize = 2048;
 
 /// Largest equal-length, WireGuard-padded plaintext that fits in an IPv4 UDP
 /// datagram after adding the transport header and authentication tag.
@@ -104,6 +105,13 @@ pub struct PeerConfig {
     pub persistent_keepalive: Option<Duration>,
 }
 
+/// A decrypted payload from [`Tunnel::recv`] and the peer that sent it.
+#[derive(Clone, Debug)]
+pub struct Packet {
+    pub public_key: PublicKey,
+    pub payload: Vec<u8>,
+}
+
 /// A point-in-time snapshot of a peer's endpoint, traffic counters, and
 /// timers.
 #[derive(Clone, Debug)]
@@ -128,9 +136,9 @@ pub struct PeerStatus {
 /// use tunstile_tunnel::{PeerConfig, PrivateKey, Tunnel};
 ///
 /// # async fn connect() -> Result<(), Box<dyn std::error::Error>> {
-/// let tunnel = Tunnel::new("0.0.0.0:0".parse()?, PrivateKey::random()).await?;
+/// let mut tunnel = Tunnel::new("0.0.0.0:0".parse()?, PrivateKey::random()).await?;
 /// let peer_key = "jrpP5X9mNSxjkd6tCnHwdRI4Rp8ZnquQj34UAqlZpx8=".parse()?;
-/// let mut peer = tunnel
+/// let peer = tunnel
 ///     .add_peer(
 ///         &peer_key,
 ///         PeerConfig {
@@ -141,7 +149,7 @@ pub struct PeerStatus {
 ///     .await?;
 ///
 /// peer.send(vec![0u8; 20]).await?;
-/// let _next_packet = peer.recv().await;
+/// let _next_packet = tunnel.recv().await;
 /// # Ok(())
 /// # }
 /// ```
@@ -149,6 +157,11 @@ pub struct Tunnel {
     our_key: Arc<PrivateKey>,
     socket: Arc<UdpSocket>,
     router: Arc<RoutingTable>,
+    control: mpsc::UnboundedSender<Control>,
+    // the tunnel keeps a sender so peers registered later can be handed a
+    // clone; the queue never closes while the tunnel is alive
+    inbound_tx: mpsc::Sender<Packet>,
+    inbound_rx: mpsc::Receiver<Packet>,
     // only the read loop's clone is read in production; the tunnel keeps a
     // handle solely so tests can force the under-load path
     #[cfg(test)]
@@ -167,6 +180,7 @@ impl Tunnel {
         our_private: Arc<PrivateKey>,
         socket: Arc<UdpSocket>,
         router: Arc<RoutingTable>,
+        mut control: mpsc::UnboundedReceiver<Control>,
         under_load: Arc<AtomicBool>,
     ) {
         let clock = Clock::new();
@@ -174,14 +188,28 @@ impl Tunnel {
         let mut secret_rotated = clock.now();
         let mut bufs = vec![vec![0u8; MAX_MESSAGE_SIZE]; BATCH_SIZE];
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
+        let mut indices = IndexRouter::new();
         loop {
             let mut slices: Vec<IoSliceMut> = bufs.iter_mut().map(|b| IoSliceMut::new(b)).collect();
-            let n = match socket.recv(&mut slices, &mut metas).await {
-                Ok(n) => n,
-                Err(e) => {
-                    debug!("failed to receive packets: {:?}", e);
+            // routing updates take priority over packets: an actor binds its
+            // index before its handshake reaches the wire, so applying binds
+            // first guarantees the reply can be routed
+            let n = select! {
+                biased;
+                update = control.recv() => {
+                    let Some(update) = update else {
+                        return;
+                    };
+                    indices.apply(update, &router);
                     continue;
                 }
+                result = socket.recv(&mut slices, &mut metas) => match result {
+                    Ok(n) => n,
+                    Err(e) => {
+                        debug!("failed to receive packets: {:?}", e);
+                        continue;
+                    }
+                },
             };
             drop(slices);
             for (buf, meta) in bufs.iter_mut().zip(metas.iter()).take(n) {
@@ -237,13 +265,13 @@ impl Tunnel {
                             }
                         }
                         MessageHeader::HandshakeResponse { receiver } => {
-                            router.recv_handshake_resp(meta.addr, receiver, segment.to_vec());
+                            indices.recv_handshake_resp(meta.addr, receiver, segment.to_vec());
                         }
                         MessageHeader::Data { receiver } => {
-                            router.recv_data(meta.addr, receiver, segment.to_vec());
+                            indices.recv_data(meta.addr, receiver, segment.to_vec());
                         }
                         MessageHeader::CookieReply { receiver } => {
-                            router.recv_cookie_reply(receiver, segment.to_vec());
+                            indices.recv_cookie_reply(receiver, segment.to_vec());
                         }
                     };
                 }
@@ -256,18 +284,26 @@ impl Tunnel {
         public_key: &PublicKey,
         config: &PeerConfig,
     ) -> Result<Peer, RegisterError> {
-        let (actions, status) = self
+        let (actions, entry) = self
             .router
             .register_peer(public_key.clone())
             .ok_or(RegisterError::AlreadyRegistered)?;
-        Ok(actor::spawn(
+        let session_rx = actor::spawn(
             self.our_key.clone(),
             public_key.clone(),
             config,
-            Arc::downgrade(&self.router),
+            self.control.clone(),
             self.socket.clone(),
-            status,
+            entry.status.clone(),
             actions,
+            self.inbound_tx.clone(),
+        );
+        Ok(Peer::new(
+            public_key.clone(),
+            Arc::downgrade(&self.router),
+            Arc::downgrade(&entry),
+            entry.status.clone(),
+            session_rx,
         ))
     }
 
@@ -280,7 +316,7 @@ impl Tunnel {
     ) -> Result<Peer, RegisterError> {
         let peer = self.register_peer(public_key, &config)?;
         if let Some(endpoint) = config.endpoint {
-            let _ = self.router.connect(peer.public_key(), endpoint).await;
+            let _ = peer.connect(endpoint).await;
         }
         Ok(peer)
     }
@@ -295,6 +331,17 @@ impl Tunnel {
         config: PeerConfig,
     ) -> Result<(), SendError> {
         self.router.set_config(public_key, config).await
+    }
+
+    /// Receives the next decrypted payload from any registered peer, waiting
+    /// until one arrives. Payloads are dropped rather than queued when the
+    /// inbound queue is full — a slow reader must not stall the peers' timers
+    /// and handshakes.
+    pub async fn recv(&mut self) -> Packet {
+        self.inbound_rx
+            .recv()
+            .await
+            .expect("the tunnel holds a sender")
     }
 
     /// This tunnel's public key.
@@ -349,19 +396,25 @@ impl Tunnel {
 
     fn start(socket: UdpSocket, our_key: PrivateKey) -> Self {
         let socket = Arc::new(socket);
-        let router = Arc::new(RoutingTable::new());
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let router = Arc::new(RoutingTable::new(control.clone()));
         let under_load = Arc::new(AtomicBool::new(false));
         let our_key = Arc::new(our_key);
+        let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
         let read_task = spawn(Self::read_loop(
             our_key.clone(),
             socket.clone(),
             router.clone(),
+            control_rx,
             under_load.clone(),
         ));
         Self {
             our_key,
             socket,
             router,
+            control,
+            inbound_tx,
+            inbound_rx,
             #[cfg(test)]
             under_load,
             read_task,
@@ -412,11 +465,11 @@ mod tests {
         let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
-        let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
+        let mut tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
         tunnel_b.force_under_load();
 
-        let mut peer_a = tunnel_b
+        let _peer_a = tunnel_b
             .add_peer(&pk_a, PeerConfig::default())
             .await
             .unwrap();
@@ -438,11 +491,11 @@ mod tests {
 
         let payload = b"through the cookie".to_vec();
         peer_b.send(payload.clone()).await.unwrap();
-        let got = tokio::time::timeout(Duration::from_secs(5), peer_a.recv())
+        let got = tokio::time::timeout(Duration::from_secs(5), tunnel_b.recv())
             .await
-            .expect("payload not delivered")
-            .unwrap();
-        assert_eq!(got, payload);
+            .expect("payload not delivered");
+        assert_eq!(got.public_key, pk_a);
+        assert_eq!(got.payload, payload);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -452,16 +505,16 @@ mod tests {
         let sk_b = PrivateKey::random();
         let pk_b = sk_b.public_key();
 
-        let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
-        let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
+        let mut tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
+        let mut tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
 
         // b is the responder; a initiates the handshake.
-        let mut peer_a = tunnel_b
+        let peer_a = tunnel_b
             .add_peer(&pk_a, PeerConfig::default())
             .await
             .unwrap();
-        let mut peer_b = tunnel_a
+        let peer_b = tunnel_a
             .add_peer(
                 &pk_b,
                 PeerConfig {
@@ -492,8 +545,9 @@ mod tests {
         let payload_a = b"hello from a".to_vec();
         let payload_a_len = Transport::packet_len(payload_a.len()) as u64;
         peer_b.send(payload_a.clone()).await.unwrap();
-        let data = peer_a.recv().await;
-        assert_eq!(data.unwrap(), payload_a);
+        let data = tunnel_b.recv().await;
+        assert_eq!(data.public_key, pk_a);
+        assert_eq!(data.payload, payload_a);
 
         let stat = tunnel_b.peer(&pk_a).unwrap();
         let b_rx = b_rx + payload_a_len;
@@ -508,8 +562,9 @@ mod tests {
         let payload_b = b"hello from b".to_vec();
         let payload_b_len = Transport::packet_len(payload_b.len()) as u64;
         peer_a.send(payload_b.clone()).await.unwrap();
-        let data = peer_b.recv().await;
-        assert_eq!(data.unwrap(), payload_b);
+        let data = tunnel_a.recv().await;
+        assert_eq!(data.public_key, pk_b);
+        assert_eq!(data.payload, payload_b);
 
         let stat = tunnel_a.peer(&pk_b).unwrap();
         assert_eq!(stat.tx_bytes, a_tx);
@@ -528,10 +583,10 @@ mod tests {
         let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
-        let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
+        let mut tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
 
-        let mut peer_a = tunnel_b
+        let _peer_a = tunnel_b
             .add_peer(&pk_a, PeerConfig::default())
             .await
             .unwrap();
@@ -550,11 +605,10 @@ mod tests {
         let payload = b"staged before handshake".to_vec();
         peer_b.send(payload.clone()).await.unwrap();
 
-        let data = tokio::time::timeout(Duration::from_secs(5), peer_a.recv())
+        let data = tokio::time::timeout(Duration::from_secs(5), tunnel_b.recv())
             .await
-            .expect("staged payload not delivered")
-            .unwrap();
-        assert_eq!(data, payload);
+            .expect("staged payload not delivered");
+        assert_eq!(data.payload, payload);
     }
 
     // a send to a peer with no known endpoint stays staged (no handshake
@@ -566,7 +620,7 @@ mod tests {
         let sk_b = PrivateKey::random();
         let pk_b = sk_b.public_key();
 
-        let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
+        let mut tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
         let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
 
@@ -578,7 +632,7 @@ mod tests {
         peer_a.send(payload.clone()).await.unwrap();
         assert!(peer_a.status().last_send.is_none());
 
-        let mut peer_b = tunnel_a
+        let _peer_b = tunnel_a
             .add_peer(
                 &pk_b,
                 PeerConfig {
@@ -589,14 +643,14 @@ mod tests {
             .await
             .unwrap();
 
-        let data = tokio::time::timeout(Duration::from_secs(5), peer_b.recv())
+        let data = tokio::time::timeout(Duration::from_secs(5), tunnel_a.recv())
             .await
-            .expect("staged payload not delivered")
-            .unwrap();
-        assert_eq!(data, payload);
+            .expect("staged payload not delivered");
+        assert_eq!(data.public_key, pk_b);
+        assert_eq!(data.payload, payload);
     }
 
-    // the peer's inbound queue only closes once its actor has shut down,
+    // the peer's session watch only closes once its actor has shut down,
     // which requires the tunnel drop to release the routing table
     #[tokio::test(flavor = "multi_thread")]
     async fn drop_terminates_actors() {
@@ -605,16 +659,16 @@ mod tests {
         let pk_b = sk_b.public_key();
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
-        let mut peer_b = tunnel_a
+        let peer_b = tunnel_a
             .add_peer(&pk_b, PeerConfig::default())
             .await
             .unwrap();
         drop(tunnel_a);
 
-        let closed = tokio::time::timeout(Duration::from_secs(2), peer_b.recv())
+        let ready = tokio::time::timeout(Duration::from_secs(2), peer_b.ready())
             .await
             .expect("peer actor leaked after tunnel drop");
-        assert!(closed.is_none());
+        assert_eq!(ready, Err(SendError::TunnelClosed));
         assert_eq!(
             peer_b.send(b"closed".to_vec()).await,
             Err(SendError::TunnelClosed)
@@ -659,10 +713,10 @@ mod tests {
         let psk = PresharedKey::from([7u8; 32]);
 
         let tunnel_a = Tunnel::new(loopback(), sk_a).await.unwrap();
-        let tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
+        let mut tunnel_b = Tunnel::new(loopback(), sk_b).await.unwrap();
         let addr_b = tunnel_b.local_addr().unwrap();
 
-        let mut peer_a = tunnel_b
+        let _peer_a = tunnel_b
             .add_peer(&pk_a, PeerConfig::default())
             .await
             .unwrap();
@@ -707,11 +761,10 @@ mod tests {
         // Updating the pre-shared key leaves the established session usable.
         let payload = b"psk update".to_vec();
         peer_b.send(payload.clone()).await.unwrap();
-        let data = tokio::time::timeout(Duration::from_secs(5), peer_a.recv())
+        let data = tokio::time::timeout(Duration::from_secs(5), tunnel_b.recv())
             .await
-            .expect("payload not delivered")
-            .unwrap();
-        assert_eq!(data, payload);
+            .expect("payload not delivered");
+        assert_eq!(data.payload, payload);
 
         // A later handshake uses the updated key on both sides.
         peer_b.connect(addr_b).await.unwrap();
@@ -726,11 +779,10 @@ mod tests {
 
         let payload = b"after psk update".to_vec();
         peer_b.send(payload.clone()).await.unwrap();
-        let data = tokio::time::timeout(Duration::from_secs(5), peer_a.recv())
+        let data = tokio::time::timeout(Duration::from_secs(5), tunnel_b.recv())
             .await
-            .expect("payload not delivered after replacement handshake")
-            .unwrap();
-        assert_eq!(data, payload);
+            .expect("payload not delivered after replacement handshake");
+        assert_eq!(data.payload, payload);
     }
 
     // a mismatched preshared key must not complete a handshake, and the
