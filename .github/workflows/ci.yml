@@ -34,6 +34,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo check -p tunstile_protocol --no-default-features
+          rustup target add riscv32imac-unknown-none-elf
           cargo check -p tunstile_protocol --target riscv32imac-unknown-none-elf
       - name: Build docs
         if: runner.os == 'Linux'
