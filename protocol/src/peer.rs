@@ -177,12 +177,6 @@ impl Peer {
         }
     }
 
-    /// Sets the optional pre-shared key.
-    pub fn preshared_key(mut self, preshared_key: PresharedKey) -> Self {
-        self.preshared_key = Some(preshared_key);
-        self
-    }
-
     /// Replaces or clears the pre-shared key without discarding transport
     /// sessions or a pending handshake.
     pub fn set_preshared_key(&mut self, preshared_key: Option<PresharedKey>) {
@@ -579,7 +573,8 @@ mod tests {
         let a_key = PrivateKey::random();
         let b_key = PrivateKey::random();
         let mut a = Peer::new(b_key.public_key());
-        let mut b = Peer::new(a_key.public_key()).preshared_key(psk.clone());
+        let mut b = Peer::new(a_key.public_key());
+        b.set_preshared_key(Some(psk.clone()));
 
         let mut init = [0u8; handshake::INIT_MSG_LENGTH];
         a.initiate(&a_key, values(1), &mut init).unwrap();

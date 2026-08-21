@@ -17,13 +17,6 @@
 const AEAD_TAG_SIZE: usize = 16;
 const MAC_SIZE: usize = 16;
 
-/// Error parsing a message type byte.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum MessageTypeParseError {
-    #[error("invalid message type")]
-    InvalidMessageType,
-}
-
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum MessageType {
     HandshakeInit = 0x01,
@@ -33,7 +26,7 @@ enum MessageType {
 }
 
 impl TryFrom<u8> for MessageType {
-    type Error = MessageTypeParseError;
+    type Error = MessageHeaderParseError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -41,7 +34,7 @@ impl TryFrom<u8> for MessageType {
             x if x == MessageType::HandshakeResp as u8 => Ok(MessageType::HandshakeResp),
             x if x == MessageType::Cookie as u8 => Ok(MessageType::Cookie),
             x if x == MessageType::Data as u8 => Ok(MessageType::Data),
-            _ => Err(MessageTypeParseError::InvalidMessageType),
+            _ => Err(MessageHeaderParseError::InvalidMessageType),
         }
     }
 }
@@ -55,8 +48,8 @@ pub enum MessageHeaderParseError {
     #[error("invalid message header")]
     InvalidHeader,
 
-    #[error("invalid message type: {0}")]
-    InvalidMessageType(#[from] MessageTypeParseError),
+    #[error("invalid message type")]
+    InvalidMessageType,
 }
 
 /// The type and receiver index of a validated WireGuard message, parsed from

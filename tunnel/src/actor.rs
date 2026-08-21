@@ -82,7 +82,6 @@ impl HandshakeAttempt {
 struct Session {
     initiator: bool,
     established: Timestamp,
-    expires_at: Timestamp,
     // a received payload awaits acknowledgement (passive keepalive)
     keepalive_at: Option<Timestamp>,
     // sent data went unanswered; assume the session died
@@ -94,10 +93,13 @@ impl Session {
         Self {
             initiator,
             established: now,
-            expires_at: now + REJECT_AFTER_TIME,
             keepalive_at: None,
             new_handshake_at: None,
         }
+    }
+
+    fn expires_at(&self) -> Timestamp {
+        self.established + REJECT_AFTER_TIME
     }
 
     fn data_sent(&mut self, now: Timestamp) {
@@ -118,7 +120,7 @@ impl Session {
     }
 
     fn usable(&self, now: Timestamp) -> bool {
-        now < self.expires_at
+        now < self.expires_at()
     }
 
     fn rekey_after_send(&self, now: Timestamp) -> bool {
@@ -601,7 +603,7 @@ impl PeerActor {
         loop {
             let handshake_at = self.handshake.map(|handshake| handshake.retry_at);
             let session = self.session.as_ref();
-            let expires_at = session.map(|session| session.expires_at);
+            let expires_at = session.map(Session::expires_at);
             let keepalive_at = session.and_then(|session| session.keepalive_at);
             let new_handshake_at = session.and_then(|session| session.new_handshake_at);
             let persistent_at = self.persistent_keepalive_at();
@@ -672,9 +674,7 @@ pub(crate) fn spawn(
     let (session_tx, session_rx) = watch::channel(false);
     let label = peer_label(&public_key);
     let mut machine = PeerState::new(public_key);
-    if let Some(psk) = config.preshared_key.clone() {
-        machine = machine.preshared_key(psk);
-    }
+    machine.set_preshared_key(config.preshared_key.clone());
     tokio::spawn(
         PeerActor {
             label,
@@ -791,7 +791,7 @@ mod tests {
     fn an_idle_session_only_expires() {
         let now = Timestamp::default();
         let session = Session::new(true, now);
-        assert_eq!(session.expires_at, now + REJECT_AFTER_TIME);
+        assert_eq!(session.expires_at(), now + REJECT_AFTER_TIME);
         assert_eq!(session.keepalive_at, None);
         assert_eq!(session.new_handshake_at, None);
         assert!(session.usable(now));

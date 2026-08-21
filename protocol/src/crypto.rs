@@ -1,7 +1,4 @@
-use core::{
-    array,
-    ops::{Deref, RangeFrom},
-};
+use core::{array, ops::RangeFrom};
 
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::{
@@ -20,14 +17,6 @@ pub(crate) struct Hash256([u8; 32]);
 
 impl AsRef<[u8]> for Hash256 {
     fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl Deref for Hash256 {
-    type Target = [u8; 32];
-
-    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
@@ -250,16 +239,16 @@ mod tests {
 
         for (key, input, t0, t1, t2) in tests {
             let [tt0] = kdf::<1>(key, input);
-            assert_eq!(tt0[..], t0[..], "kdf1");
+            assert_eq!(tt0.as_ref(), t0, "kdf1");
 
             let [tt0, tt1] = kdf::<2>(key, input);
-            assert_eq!(tt0[..], t0[..], "kdf2 tt0");
-            assert_eq!(tt1[..], t1[..], "kdf2 tt1");
+            assert_eq!(tt0.as_ref(), t0, "kdf2 tt0");
+            assert_eq!(tt1.as_ref(), t1, "kdf2 tt1");
 
             let [tt0, tt1, tt2] = kdf::<3>(key, input);
-            assert_eq!(tt0[..], t0[..], "kdf3 tt0");
-            assert_eq!(tt1[..], t1[..], "kdf3 tt1");
-            assert_eq!(tt2[..], t2[..], "kdf3 tt2");
+            assert_eq!(tt0.as_ref(), t0, "kdf3 tt0");
+            assert_eq!(tt1.as_ref(), t1, "kdf3 tt1");
+            assert_eq!(tt2.as_ref(), t2, "kdf3 tt2");
         }
     }
 }

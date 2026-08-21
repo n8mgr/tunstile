@@ -1402,7 +1402,6 @@ dependencies = [
 name = "tunstile_tunnel"
 version = "0.0.1"
 dependencies = [
- "base64",
  "clap",
  "criterion",
  "env_logger",

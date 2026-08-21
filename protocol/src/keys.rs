@@ -101,13 +101,6 @@ impl PrivateKey {
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
     }
-
-    /// Returns the key in the standard WireGuard base64 encoding, kept out
-    /// of `Display` so the secret can't be logged by accident.
-    #[cfg(feature = "std")]
-    pub fn to_base64(&self) -> String {
-        BASE64_STANDARD.encode(self.to_bytes())
-    }
 }
 
 impl From<[u8; 32]> for PrivateKey {
